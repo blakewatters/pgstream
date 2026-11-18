@@ -129,7 +129,7 @@ func (a *dmlAdapter) buildInsertQueries(d *wal.Data, schemaInfo schemaInfo) []*q
 			sql: fmt.Sprintf("INSERT INTO %s(%s) OVERRIDING SYSTEM VALUE VALUES(%s)%s",
 				quotedTableName(d.Schema, d.Table), strings.Join(names, ", "),
 				strings.Join(placeholders, ", "),
-				a.buildOnConflictQuery(d, names)),
+				a.buildOnConflictQuery(d, names, schemaInfo)),
 			args: values,
 		},
 	}
@@ -236,13 +236,23 @@ func (a *dmlAdapter) buildSetQuery(cols []wal.Column, rowColumns []string, rowVa
 	return setQuery, setValues
 }
 
-func (a *dmlAdapter) buildOnConflictQuery(d *wal.Data, filteredColumnNames []string) string {
+// conflictTargetColumns returns the quoted primary key columns an insert names
+// as its ON CONFLICT target: the event's identity metadata when the injector
+// provided it, otherwise the target table's own primary key.
+func (a *dmlAdapter) conflictTargetColumns(d *wal.Data, si schemaInfo) []string {
+	if cols := a.extractPrimaryKeyColumnNames(d.Metadata.InternalColIDs, d.Columns); len(cols) > 0 {
+		return cols
+	}
+	return si.primaryKeyColumns
+}
+
+func (a *dmlAdapter) buildOnConflictQuery(d *wal.Data, filteredColumnNames []string, si schemaInfo) string {
 	switch a.onConflictAction {
 	case onConflictUpdate:
 		// on conflict do update requires a conflict target. If there are no
 		// primary keys to use for the conflict target, default to error
 		// behaviour
-		primaryKeyCols := a.extractPrimaryKeyColumnNames(d.Metadata.InternalColIDs, d.Columns)
+		primaryKeyCols := a.conflictTargetColumns(d, si)
 		if len(primaryKeyCols) == 0 {
 			return ""
 		}
@@ -253,7 +263,14 @@ func (a *dmlAdapter) buildOnConflictQuery(d *wal.Data, filteredColumnNames []str
 		}
 		return fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", strings.Join(primaryKeyCols, ","), strings.Join(cols, ", "))
 	case onConflictDoNothing:
-		return " ON CONFLICT DO NOTHING"
+		// Name the primary key as the arbiter. Without a target every unique
+		// index is one, and postgres rejects the statement outright when any
+		// of them is deferrable, so no row of that table could be inserted.
+		primaryKeyCols := a.conflictTargetColumns(d, si)
+		if len(primaryKeyCols) == 0 {
+			return " ON CONFLICT DO NOTHING"
+		}
+		return fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", strings.Join(primaryKeyCols, ","))
 	default:
 		return ""
 	}

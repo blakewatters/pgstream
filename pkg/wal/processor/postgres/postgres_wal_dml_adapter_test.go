@@ -593,7 +593,7 @@ func TestDMLAdapter_walDataToQueries(t *testing.T) {
 					schema:      testSchema,
 					table:       testTable,
 					columnNames: quotedColumnNames,
-					sql:         fmt.Sprintf("INSERT INTO %s(\"id\", \"name\") OVERRIDING SYSTEM VALUE VALUES($1, $2) ON CONFLICT DO NOTHING", quotedTestTable),
+					sql:         fmt.Sprintf("INSERT INTO %s(\"id\", \"name\") OVERRIDING SYSTEM VALUE VALUES($1, $2) ON CONFLICT (\"id\") DO NOTHING", quotedTestTable),
 					args:        []any{1, "alice"},
 				},
 			},

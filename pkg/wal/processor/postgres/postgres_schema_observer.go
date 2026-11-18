@@ -48,6 +48,9 @@ type pgSchemaObserver struct {
 	// meant to drop it. Lookups record the epoch before querying and only
 	// cache the result if it has not moved.
 	enumCacheEpoch atomic.Uint64
+	// primaryKeyTableColumns is a map of schema.table to the quoted names of
+	// its primary key columns, empty for a table without one.
+	primaryKeyTableColumns *synclib.Map[string, []string]
 }
 
 // newPGSchemaObserver returns a postgres observer that tracks schemas,
@@ -87,6 +90,7 @@ func newPGSchemaObserver(ctx context.Context, cfg *Config, logger loglib.Logger,
 		materializedViews:          synclib.NewMap[string, map[string]struct{}](),
 		columnTableSequences:       synclib.NewMap[string, map[string]string](),
 		enumTableColumns:           synclib.NewMap[string, map[string]enumColumn](),
+		primaryKeyTableColumns:     synclib.NewMap[string, []string](),
 		logger:                     logger,
 	}, nil
 }
@@ -198,6 +202,25 @@ func (o *pgSchemaObserver) getEnumColumnNames(ctx context.Context, schema, table
 	return colNames, nil
 }
 
+// getPrimaryKeyColumns returns the quoted primary key column names for the
+// given schema.table. If not cached, it queries postgres.
+func (o *pgSchemaObserver) getPrimaryKeyColumns(ctx context.Context, schema, table string) ([]string, error) {
+	key := pglib.QuoteQualifiedIdentifier(schema, table)
+
+	columns, found := o.primaryKeyTableColumns.Get(key)
+	if found {
+		return columns, nil
+	}
+
+	columns, err := o.queryPrimaryKeyColumns(ctx, schema, table)
+	if err != nil {
+		return nil, err
+	}
+
+	o.primaryKeyTableColumns.Set(key, columns)
+	return columns, nil
+}
+
 // getSchemaInfo returns the schema metadata needed to build DML queries for the
 // given schema.table, served from the internal caches and falling back to
 // postgres for whatever is missing.
@@ -222,11 +245,17 @@ func (o *pgSchemaObserver) getSchemaInfo(ctx context.Context, schema, table stri
 		return schemaInfo{}, err
 	}
 
+	primaryKeyColumns, err := o.getPrimaryKeyColumns(ctx, schema, table)
+	if err != nil {
+		return schemaInfo{}, err
+	}
+
 	return schemaInfo{
 		generatedColumns:      generatedColumns,
 		alwaysIdentityColumns: alwaysIdentityColumns,
 		sequenceColumns:       sequenceColumns,
 		enumColumns:           enumColumns,
+		primaryKeyColumns:     primaryKeyColumns,
 	}, nil
 }
 
@@ -239,6 +268,7 @@ func (o *pgSchemaObserver) update(ddlEvent *wal.DDLEvent) {
 	o.updateGeneratedColumnNames(tableObjects)
 	o.updateColumnSequences(tableObjects)
 	o.invalidateEnumColumns(tableObjects)
+	o.updatePrimaryKeyColumns(ddlEvent.GetTableObjects())
 	mvObjects := ddlEvent.GetMaterializedViewObjects()
 	if len(mvObjects) > 0 {
 		o.updateMaterializedViews(ddlEvent, mvObjects)
@@ -298,6 +328,20 @@ func (o *pgSchemaObserver) updateMaterializedViews(ddlEvent *wal.DDLEvent, mvs [
 		}
 		o.materializedViews.Set(key, mvNames)
 
+	}
+}
+
+// updatePrimaryKeyColumns sets the cached primary key of each table from the
+// DDL event, which carries it as of the statement. Only table objects do: a
+// table column object names a column, and has no key of its own.
+func (o *pgSchemaObserver) updatePrimaryKeyColumns(tables []wal.DDLObject) {
+	for _, table := range tables {
+		key := pglib.QuoteQualifiedIdentifier(table.Schema, table.GetTable())
+		columns := make([]string, 0, len(table.PrimaryKeyColumns))
+		for _, name := range table.PrimaryKeyColumns {
+			columns = append(columns, pglib.QuoteIdentifier(name))
+		}
+		o.primaryKeyTableColumns.Set(key, columns)
 	}
 }
 
@@ -467,6 +511,40 @@ func (o *pgSchemaObserver) queryEnumColumnNames(ctx context.Context, schemaName,
 			return nil, fmt.Errorf("scanning table enum column name: %w", err)
 		}
 		columns[pglib.QuoteIdentifier(columnName)] = col
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return columns, nil
+}
+
+const primaryKeyColumnsQuery = `SELECT a.attname
+	FROM pg_index i
+	JOIN pg_class c ON c.oid = i.indrelid
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+	WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary
+	ORDER BY array_position(i.indkey::smallint[], a.attnum)`
+
+func (o *pgSchemaObserver) queryPrimaryKeyColumns(ctx context.Context, schemaName, tableName string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, schemaQueryTimeout)
+	defer cancel()
+
+	rows, err := o.pgConn.Query(ctx, primaryKeyColumnsQuery, schemaName, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("getting primary key columns for table %s.%s: %w", schemaName, tableName, err)
+	}
+	defer rows.Close()
+
+	columns := []string{}
+	for rows.Next() {
+		var columnName string
+		if err := rows.Scan(&columnName); err != nil {
+			return nil, fmt.Errorf("scanning primary key column name: %w", err)
+		}
+		columns = append(columns, pglib.QuoteIdentifier(columnName))
 	}
 
 	if err := rows.Err(); err != nil {

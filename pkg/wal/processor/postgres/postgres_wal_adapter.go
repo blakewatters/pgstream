@@ -42,6 +42,11 @@ type schemaInfo struct {
 	// (see needsTextCopyForColumns), and the bulk delete path must bind their
 	// values as text[] and cast them back on the target (see bindAsText).
 	enumColumns map[string]enumColumn
+	// primaryKeyColumns are the quoted names of the target table's primary
+	// key columns, empty when it has none. They give an insert its ON CONFLICT
+	// target when the event carries no identity metadata, which is every
+	// insert of a pipeline that runs without the injector.
+	primaryKeyColumns []string
 }
 
 // enumColumn describes how to cast a column whose type resolves to a

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	pglib "github.com/xataio/pgstream/internal/postgres"
 	pgmocks "github.com/xataio/pgstream/internal/postgres/mocks"
+	pglibretrier "github.com/xataio/pgstream/internal/postgres/retrier"
 	loglib "github.com/xataio/pgstream/pkg/log"
 	"github.com/xataio/pgstream/pkg/wal"
 	"github.com/xataio/pgstream/pkg/wal/checkpointer"
@@ -1312,6 +1313,35 @@ func TestBatchWriter_sendBatch_ddlOncePerTransaction(t *testing.T) {
 
 			// every replay the writer ran, failed ones included, in order
 			require.Equal(t, tc.wantReplays, replays)
+		})
+	}
+}
+
+// A query the writer would drop must reach it: the retrier wraps every
+// transaction the writer runs, and its default policy has no bound, so an
+// error it retries is one the writer never gets to drop. That held
+// replication for days on a statement postgres would never accept.
+func TestBatchWriter_droppableErrorsAreNotRetried(t *testing.T) {
+	t.Parallel()
+
+	w := &BatchWriter{}
+	droppable := []error{
+		&pglib.ErrRelationDoesNotExist{},
+		&pglib.ErrConstraintViolation{},
+		&pglib.ErrSyntaxError{},
+		&pglib.ErrDataException{},
+		&pglib.ErrRelationAlreadyExists{},
+		&pglib.ErrPreconditionFailed{},
+		&pglib.ErrFeatureNotSupported{},
+		&pglib.ErrValueEncoding{},
+	}
+	for _, err := range droppable {
+		t.Run(fmt.Sprintf("%T", err), func(t *testing.T) {
+			t.Parallel()
+
+			require.False(t, w.isInternalError(err), "the writer no longer drops this error; remove it from this list")
+			require.False(t, pglibretrier.IsRetriableError(err))
+			require.False(t, pglibretrier.IsRetriableError(fmt.Errorf("batch query 0: %w", err)))
 		})
 	}
 }
