@@ -5,6 +5,7 @@
 
 version: 2
 updates:
+  # main
   - package-ecosystem: "docker"
     directory: "build/docker/postgres"
     schedule:

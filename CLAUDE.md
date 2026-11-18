@@ -19,7 +19,7 @@ make test
 go test -run TestName ./pkg/path/to/package
 
 # Run integration tests (requires Docker for testcontainers)
-PGSTREAM_INTEGRATION_TESTS=true go test -timeout 180s github.com/xataio/pgstream/pkg/stream/integration
+PGSTREAM_INTEGRATION_TESTS=true go test -timeout 600s github.com/xataio/pgstream/pkg/stream/integration
 
 # Lint (golangci-lint v2)
 make lint
@@ -86,3 +86,7 @@ Located in `pkg/stream/integration/`. They use testcontainers-go to spin up Post
 - **License headers**: All `.go` files must start with `// SPDX-License-Identifier: Apache-2.0`.
 - **No CGO**: Builds use `CGO_ENABLED=0`.
 - **Interface-driven design**: Processors, listeners, and stores use interfaces extensively with mock implementations for testing.
+
+## Documentation
+
+- **Simplified Technical English**: Write user-facing documentation (README, `docs/` guides, configuration reference, runbooks, CLI help and error text) in Simplified Technical English. Use one idea per sentence, short sentences, active voice, present tense, and the same term for a concept every time. Avoid idioms, metaphors, and marketing language.

@@ -16,6 +16,27 @@ type Transformer interface {
 	Close() error
 }
 
+// optional so that Transformer implementations outside this module keep
+// compiling; UniquenessOf treats a non-implementer as unknown
+type UniquenessReporter interface {
+	Uniqueness() Uniqueness
+}
+
+// UniquenessOf reports what t guarantees about the uniqueness of its output.
+// A transformer that does not classify itself is assumed to be capable of
+// producing duplicates, but not known to, so that both ways of leaving it
+// unclassified answer the same thing.
+func UniquenessOf(t Transformer) Uniqueness {
+	reporter, ok := t.(UniquenessReporter)
+	if !ok {
+		return UniquenessNotGuaranteed
+	}
+	if u := reporter.Uniqueness(); u != UniquenessUnspecified {
+		return u
+	}
+	return UniquenessNotGuaranteed
+}
+
 type Value struct {
 	TransformValue any
 	TransformType  string
@@ -59,6 +80,9 @@ const (
 	JSON                   TransformerType = "json"
 	Hstore                 TransformerType = "hstore"
 	PGAnonymizer           TransformerType = "pg_anonymizer"
+	EncryptedAESSIV        TransformerType = "encrypted_aes_siv"
+	LookupChoice           TransformerType = "lookup_choice"
+	FPEFF1                 TransformerType = "fpe_ff1"
 )
 
 type SupportedDataType string
@@ -85,6 +109,7 @@ const (
 	AllDataTypes           SupportedDataType = "all"
 	CitextDataType         SupportedDataType = "citext"
 	HstoreDataType         SupportedDataType = "hstore"
+	EnumDataType           SupportedDataType = "enum"
 )
 
 const (
@@ -94,6 +119,7 @@ const (
 type Definition struct {
 	SupportedTypes []SupportedDataType
 	Parameters     []Parameter
+	Uniqueness     Uniqueness
 }
 
 type Parameter struct {

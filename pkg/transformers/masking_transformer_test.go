@@ -205,6 +205,107 @@ func TestMaskingTransformer_Transform(t *testing.T) {
 			wantErr: nil,
 		},
 		{
+			name: "ok - default with multi-byte characters",
+			params: ParameterValues{
+				"type": "default",
+			},
+			input:   "José Müller",
+			want:    "***********",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with mask indexes and multi-byte characters",
+			params: ParameterValues{
+				"type":       "custom",
+				"mask_begin": "2",
+				"mask_end":   "6",
+			},
+			input:   "東京都渋谷区神南",
+			want:    "東京****神南",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with unmask indexes and multi-byte characters",
+			params: ParameterValues{
+				"type":         "custom",
+				"unmask_begin": "50%",
+			},
+			input:   "ñandúñandú",
+			want:    "*****ñandú",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with percentage mask begin and multi-byte characters",
+			params: ParameterValues{
+				"type":       "custom",
+				"mask_begin": "50%",
+			},
+			input:   "東京都渋谷区神南",
+			want:    "東京都渋****",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with percentage mask end and multi-byte characters",
+			params: ParameterValues{
+				"type":     "custom",
+				"mask_end": "25%",
+			},
+			input:   "東京都渋谷区神南",
+			want:    "**都渋谷区神南",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with absolute unmask indexes and multi-byte characters",
+			params: ParameterValues{
+				"type":         "custom",
+				"unmask_begin": "1",
+				"unmask_end":   "3",
+			},
+			input:   "ñandú",
+			want:    "*an**",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with mask indexes and invalid UTF-8 byte array",
+			params: ParameterValues{
+				"type":       "custom",
+				"mask_begin": "2",
+			},
+			input:   []byte{0xff, 0xfe, 'A', 'B'},
+			want:    "\xff\xfe**",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with unmask indexes and invalid UTF-8 byte array",
+			params: ParameterValues{
+				"type":       "custom",
+				"unmask_end": "2",
+			},
+			input:   []byte{0xff, 0xfe, 'A', 'B'},
+			want:    "\xff\xfe**",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with mask indexes and invalid UTF-8 string",
+			params: ParameterValues{
+				"type":     "custom",
+				"mask_end": "3",
+			},
+			input:   "caf\xe9 cr\xe8me",
+			want:    "***\xe9 cr\xe8me",
+			wantErr: nil,
+		},
+		{
+			name: "ok - custom masking with an invalid byte between multi-byte characters",
+			params: ParameterValues{
+				"type":       "custom",
+				"mask_begin": "2",
+			},
+			input:   "東\xff京",
+			want:    "東\xff*",
+			wantErr: nil,
+		},
+		{
 			name: "error - invalid input type",
 			params: ParameterValues{
 				"type": "default",
@@ -225,6 +326,90 @@ func TestMaskingTransformer_Transform(t *testing.T) {
 				return
 			}
 			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestMaskingTransformer_Uniqueness(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		params ParameterValues
+	}{
+		{
+			name:   "default masks the whole value",
+			params: ParameterValues{},
+		},
+		{
+			name:   "id keeps a 6 character prefix",
+			params: ParameterValues{"type": "id"},
+		},
+		{
+			name:   "credit_card keeps a 6 character prefix",
+			params: ParameterValues{"type": "credit_card"},
+		},
+		{
+			name:   "custom mask range",
+			params: ParameterValues{"type": "custom", "mask_begin": "2", "mask_end": "6"},
+		},
+		{
+			name:   "custom mask range mixing an absolute and a percentage bound",
+			params: ParameterValues{"type": "custom", "mask_begin": "50", "mask_end": "50%"},
+		},
+		{
+			name:   "custom unmask range leaving a masked prefix",
+			params: ParameterValues{"type": "custom", "unmask_begin": "4"},
+		},
+		{
+			name:   "custom unmask range leaving a masked suffix",
+			params: ParameterValues{"type": "custom", "unmask_end": "4"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			transformer, err := NewMaskingTransformer(tt.params)
+			require.NoError(t, err)
+			require.Equal(t, UniquenessLossy, transformer.Uniqueness())
+		})
+	}
+}
+
+func TestMaskingTransformer_rejectsMaskCoveringNoCharacters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		params ParameterValues
+	}{
+		{
+			name:   "mask range of zero characters",
+			params: ParameterValues{"type": "custom", "mask_begin": "3", "mask_end": "3"},
+		},
+		{
+			name:   "mask range of zero characters, percentages",
+			params: ParameterValues{"type": "custom", "mask_begin": "50%", "mask_end": "50%"},
+		},
+		{
+			name:   "unmask range covering the whole value",
+			params: ParameterValues{"type": "custom", "unmask_begin": "0", "unmask_end": "100%"},
+		},
+		{
+			name:   "unmask range covering the whole value by default",
+			params: ParameterValues{"type": "custom", "unmask_begin": "0"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			transformer, err := NewMaskingTransformer(tt.params)
+			require.ErrorIs(t, err, errMaskCoversNoCharacters)
+			require.Nil(t, transformer)
 		})
 	}
 }

@@ -3,11 +3,12 @@
 package greenmask
 
 import (
-	"time"
+	"math"
 
-	greenmaskgenerators "github.com/eminano/greenmask/pkg/generators"
 	greenmasktransformers "github.com/eminano/greenmask/pkg/generators/transformers"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/xataio/pgstream/pkg/transformers"
+	"github.com/xataio/pgstream/pkg/transformers/generators"
 )
 
 const (
@@ -15,19 +16,24 @@ const (
 	deterministic = "deterministic"
 )
 
+// setGenerator configures the transformer with a generator that is safe for
+// concurrent use. pgstream shares one transformer per column across all
+// snapshot worker goroutines, and the generator is the only mutable state in
+// the greenmask transformers (except for the string one, which pools whole
+// instances), so this makes the transformers safe to call concurrently
+// (issues #789 and #800).
 func setGenerator(t greenmasktransformers.Transformer, params transformers.ParameterValues) error {
 	generatorType, err := getGeneratorType(params)
 	if err != nil {
 		return err
 	}
 
-	var greenmaskGenerator greenmaskgenerators.Generator
+	var generator generators.Generator
 	switch generatorType {
 	case random:
-		greenmaskGenerator = greenmaskgenerators.NewRandomBytes(time.Now().UnixNano(), t.GetRequiredGeneratorByteLength())
+		generator = generators.NewRandomBytesGenerator(t.GetRequiredGeneratorByteLength())
 	case deterministic:
-		var err error
-		greenmaskGenerator, err = greenmaskgenerators.GetHashBytesGen([]byte{}, t.GetRequiredGeneratorByteLength())
+		generator, err = generators.NewDeterministicBytesGenerator(t.GetRequiredGeneratorByteLength())
 		if err != nil {
 			return err
 		}
@@ -35,7 +41,7 @@ func setGenerator(t greenmasktransformers.Transformer, params transformers.Param
 		return transformers.ErrUnsupportedGenerator
 	}
 
-	return t.SetGenerator(greenmaskGenerator)
+	return t.SetGenerator(generator)
 }
 
 func getGeneratorType(params transformers.ParameterValues) (string, error) {
@@ -56,4 +62,15 @@ func findParameterArray[T any](params transformers.ParameterValues, name string,
 		return defaultVal, nil
 	}
 	return val, nil
+}
+
+func float64FromNumeric(n pgtype.Numeric) float64 {
+	f, err := n.Float64Value()
+	if err == nil {
+		return f.Float64
+	}
+	if n.Int != nil && n.Int.Sign() < 0 {
+		return -math.MaxFloat64
+	}
+	return math.MaxFloat64
 }

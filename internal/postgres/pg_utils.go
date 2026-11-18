@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/lib/pq"
+	pgxvec "github.com/pgvector/pgvector-go/pgx"
+	pgjson "github.com/xataio/pgstream/internal/json"
 )
 
 type QualifiedName struct {
@@ -73,6 +75,11 @@ func QuoteIdentifier(s string) string {
 	return pq.QuoteIdentifier(s)
 }
 
+// QuoteRawIdentifier always quotes.
+func QuoteRawIdentifier(s string) string {
+	return pq.QuoteIdentifier(s)
+}
+
 // UnquoteIdentifier reverses the quoting applied by QuoteIdentifier. If the
 // string is not a quoted identifier, it is returned as-is. If it is a quoted
 // identifier, the leading and trailing quotes are removed, and any embedded
@@ -95,7 +102,21 @@ func QuoteQualifiedIdentifier(schema, table string) string {
 }
 
 func IsQuotedIdentifier(s string) bool {
-	return len(s) > 2 && strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`)
+	if len(s) <= 2 || !strings.HasPrefix(s, `"`) || !strings.HasSuffix(s, `"`) {
+		return false
+	}
+	inner := s[1 : len(s)-1]
+	for i := 0; i < len(inner); i++ {
+		if inner[i] != '"' {
+			continue
+		}
+		if i+1 < len(inner) && inner[i+1] == '"' {
+			i++
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type (
@@ -132,14 +153,22 @@ func newIdentifier(tableName string) (pgx.Identifier, error) {
 	// that will be called and will add quotes, so if there are existing ones,
 	// it will produce an invalid identifier name.
 	for i, part := range identifier {
-		identifier[i] = removeQuotes(part)
+		identifier[i] = UnquoteIdentifier(part)
 	}
 
 	return identifier, nil
 }
 
-func removeQuotes(s string) string {
-	return strings.Trim(s, `"`)
+// unquoteIdentifiers returns the names unquoted, in a new slice.
+//
+// The slice is new because the caller keeps the quoted names for the SQL it
+// builds, and a retry of the same statement has to find them unchanged.
+func unquoteIdentifiers(names []string) []string {
+	out := make([]string, len(names))
+	for i, name := range names {
+		out[i] = UnquoteIdentifier(name)
+	}
+	return out
 }
 
 func extractDatabase(url string) (string, error) {
@@ -150,21 +179,170 @@ func extractDatabase(url string) (string, error) {
 	return pgCfg.Database, nil
 }
 
-func registerTypesToConnMap(ctx context.Context, conn *pgx.Conn) error {
-	var hstoreOID uint32
-	err := conn.QueryRow(ctx, "SELECT oid FROM pg_type WHERE typname = 'hstore'").Scan(&hstoreOID)
-	if err == nil && hstoreOID != 0 {
-		conn.TypeMap().RegisterType(&pgtype.Type{
-			Codec: pgtype.HstoreCodec{},
-			Name:  "hstore",
-			OID:   hstoreOID,
-		})
-	}
+// extensionType describes a postgres extension type that pgx does not know
+// about out of the box and how to make pgx encode/decode it correctly.
+type extensionType struct {
+	// name is the unqualified type name as it appears to `to_regtype`
+	name string
+	// extraNames lists additional type names registered by the same register
+	// call, beyond name (e.g. pgvector's "vector" entry also registers halfvec
+	// and sparsevec). Used by ExtensionTypeNames so callers see every type the
+	// entry covers.
+	extraNames []string
+	// pgtype.TextCodec answers binary with text.
+	// Binary COPY of such a column corrupts.
+	textCopyOnly bool
+	// register is invoked with the resolved OID once the type has been found
+	// in pg_type. Implementations are free to register additional related types.
+	register func(ctx context.Context, conn *pgx.Conn, oid uint32) error
+}
 
+// extensionTypes lists the postgres extension types pgstream teaches pgx
+// about on every connection.
+var extensionTypes = []extensionType{
+	{name: "json", register: registerWithCodec("json", &pgtype.JSONCodec{Marshal: pgjson.Marshal, Unmarshal: pgjson.UnmarshalUseInt64})},
+	{name: "jsonb", register: registerWithCodec("jsonb", &pgtype.JSONBCodec{Marshal: pgjson.Marshal, Unmarshal: pgjson.UnmarshalUseInt64})},
+
+	{name: "hstore", register: registerWithCodec("hstore", pgtype.HstoreCodec{})},
+	{name: "vector", extraNames: []string{"halfvec", "sparsevec", "_vector", "_halfvec", "_sparsevec"}, register: func(ctx context.Context, conn *pgx.Conn, _ uint32) error {
+		// pgxvec registers the vector, halfvec and sparsevec scalar types and
+		// their array variants (_vector, _halfvec, _sparsevec) in one call —
+		// the OID lookup above is just a gate to skip when pgvector is
+		// not installed.
+		if err := pgxvec.RegisterTypes(ctx, conn); err != nil {
+			return fmt.Errorf("registering pgvector types: %w", err)
+		}
+		return nil
+	}},
+	// Each has a binary layout the codec cannot produce:
+	//   - cube: int32 header, then float8 coordinates
+	//   - ltree: 1-byte version, then the path
+	//   - timetz: int64 micros, then int32 offset
+	{name: "cube", textCopyOnly: true, register: registerWithCodec("cube", pgtype.TextCodec{})},
+	{name: "ltree", textCopyOnly: true, register: registerWithCodec("ltree", pgtype.TextCodec{})},
+	{name: "timetz", textCopyOnly: true, register: registerWithCodec("timetz", pgtype.TextCodec{})},
+}
+
+// ExtensionTypeNames returns the names of every postgres extension type
+// pgstream teaches pgx about on each connection (see extensionTypes), including
+// the additional types a single entry registers (e.g. pgvector's halfvec and
+// sparsevec). Callers that need to know whether pgstream can handle a type
+// beyond pgx's built-in set — such as the preflight schema compatibility check
+// — consult this list so it stays in sync with what pgstream actually registers.
+func ExtensionTypeNames() []string {
+	names := make([]string, 0, len(extensionTypes))
+	for _, ext := range extensionTypes {
+		names = append(names, ext.name)
+		names = append(names, ext.extraNames...)
+	}
+	return names
+}
+
+// TextCopyOnlyTypeNames returns the extension types needing text COPY.
+func TextCopyOnlyTypeNames() []string {
+	return extensionTypeNamesWhere(true)
+}
+
+// BinaryCopySafeTypeNames returns the extension types binary COPY handles.
+// pgx's static map has no entry for them.
+func BinaryCopySafeTypeNames() []string {
+	return extensionTypeNamesWhere(false)
+}
+
+func extensionTypeNamesWhere(textCopyOnly bool) []string {
+	names := make([]string, 0, len(extensionTypes))
+	for _, ext := range extensionTypes {
+		if ext.textCopyOnly != textCopyOnly {
+			continue
+		}
+		names = append(names, ext.name)
+		names = append(names, ext.extraNames...)
+	}
+	return names
+}
+
+// registerTypesToConnMap teaches pgx about the postgres extension types
+// listed in extensionTypes for every new connection.
+//
+// To add a new extension type, append one entry to extensionTypes above:
+//   - Simple case (one OID, one codec): use registerWithCodec("name", codec).
+//     Pass pgtype.TextCodec{} with textCopyOnly for a text-only type.
+//   - Complex case (extension exposes several related types, or needs
+//     library-side setup): inline a register func; see the "vector" entry,
+//     which delegates to pgxvec.RegisterTypes.
+//
+// Entries are no-ops when the extension is not installed on the target.
+func registerTypesToConnMap(ctx context.Context, conn *pgx.Conn) error {
+	for _, ext := range extensionTypes {
+		if err := registerExtensionType(ctx, conn, ext); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-const DiscoverAllSchemasQuery = "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pgstream')"
+// registerExtensionType resolves the OID for ext.name via `to_regtype` and,
+// if the type exists, hands it to ext.register. A missing extension is not
+// an error.
+func registerExtensionType(ctx context.Context, conn *pgx.Conn, ext extensionType) error {
+	var oid uint32
+	if err := conn.QueryRow(ctx, "SELECT to_regtype($1)::oid", ext.name).Scan(&oid); err != nil || oid == 0 {
+		return nil
+	}
+	return ext.register(ctx, conn, oid)
+}
+
+// registerWithCodec builds a register function that binds the given codec to
+// the (name, OID) pair on the connection's type map. Used for extensions
+// where one OID maps to one codec.
+func registerWithCodec(name string, codec pgtype.Codec) func(ctx context.Context, conn *pgx.Conn, oid uint32) error {
+	return func(_ context.Context, conn *pgx.Conn, oid uint32) error {
+		conn.TypeMap().RegisterType(&pgtype.Type{
+			Codec: codec,
+			Name:  name,
+			OID:   oid,
+		})
+		return nil
+	}
+}
+
+// rawJSONTextCodec decodes json/jsonb values as their raw text representation
+// (Go string) instead of unmarshalling them into Go values. Unmarshalling is
+// lossy: the JSON null value ('null'::jsonb) becomes Go nil, indistinguishable
+// from SQL NULL, and re-marshalling can reorder object keys and drop
+// formatting for the json type.
+//
+// It only supports the text format: in binary format the server prefixes jsonb
+// values with a version byte, which would leak into the decoded string when
+// jsonb values are nested inside arrays (pgx fetches array elements in binary
+// when the element codec claims binary support).
+type rawJSONTextCodec struct {
+	pgtype.TextCodec
+}
+
+func (rawJSONTextCodec) FormatSupported(format int16) bool {
+	return format == pgtype.TextFormatCode
+}
+
+// registerRawJSONDecoding rebinds the json/jsonb types (and their arrays) on
+// the connection's type map to rawJSONTextCodec, so their values decode to raw
+// text (string). See WithRawJSONDecoding.
+func registerRawJSONDecoding(conn *pgx.Conn) {
+	registerRawJSONDecodingOnMap(conn.TypeMap())
+}
+
+func registerRawJSONDecodingOnMap(typeMap *pgtype.Map) {
+	jsonType := &pgtype.Type{Name: "json", OID: pgtype.JSONOID, Codec: rawJSONTextCodec{}}
+	jsonbType := &pgtype.Type{Name: "jsonb", OID: pgtype.JSONBOID, Codec: rawJSONTextCodec{}}
+	typeMap.RegisterType(jsonType)
+	typeMap.RegisterType(jsonbType)
+	// array types capture their element type at registration, so they must be
+	// re-registered for the element override to apply to them.
+	typeMap.RegisterType(&pgtype.Type{Name: "_json", OID: pgtype.JSONArrayOID, Codec: &pgtype.ArrayCodec{ElementType: jsonType}})
+	typeMap.RegisterType(&pgtype.Type{Name: "_jsonb", OID: pgtype.JSONBArrayOID, Codec: &pgtype.ArrayCodec{ElementType: jsonbType}})
+}
+
+const DiscoverAllSchemasQuery = "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pgstream') AND nspname NOT LIKE 'pg_temp_%' AND nspname NOT LIKE 'pg_toast_temp_%'"
 
 func DiscoverAllSchemas(ctx context.Context, conn Querier) ([]string, error) {
 	rows, err := conn.Query(ctx, DiscoverAllSchemasQuery)
@@ -212,6 +390,73 @@ func DiscoverAllSchemaTables(ctx context.Context, conn Querier, schema string) (
 	}
 
 	return tableNames, nil
+}
+
+// SelectStarColumnPredicate matches SELECT *.
+const SelectStarColumnPredicate = `a.attnum > 0 AND NOT a.attisdropped`
+
+// DiscoverTableColumnsQuery lists table columns.
+var DiscoverTableColumnsQuery = fmt.Sprintf(`SELECT n.nspname, c.relname, a.attname
+	FROM pg_catalog.pg_attribute a
+	JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.relkind IN ('r', 'p')
+	AND %s
+	AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pgstream')
+	AND n.nspname NOT LIKE 'pg\_temp\_%%' AND n.nspname NOT LIKE 'pg\_toast\_temp\_%%'
+	AND ($1::text[] IS NULL OR n.nspname = ANY($1))
+	AND ($2::text[] IS NULL OR c.relname = ANY($2))
+	ORDER BY n.nspname, c.relname, a.attnum`, SelectStarColumnPredicate)
+
+// SchemaTableColumns: unquoted schema, table.
+type SchemaTableColumns map[string]map[string][]string
+
+// ColumnsFor returns recorded columns.
+func (c SchemaTableColumns) ColumnsFor(schema, table string) []string {
+	if c == nil {
+		return nil
+	}
+	return c[UnquoteIdentifier(schema)][UnquoteIdentifier(table)]
+}
+
+// DiscoverTableColumns reads the catalog once.
+// Empty arguments mean no filter.
+func DiscoverTableColumns(ctx context.Context, conn Querier, schemas, tables []string) (SchemaTableColumns, error) {
+	unquote := func(names []string) []string {
+		if len(names) == 0 {
+			// nil filters nothing, empty nothing
+			return nil
+		}
+		unquoted := make([]string, len(names))
+		for i, name := range names {
+			unquoted[i] = UnquoteIdentifier(name)
+		}
+		return unquoted
+	}
+
+	rows, err := conn.Query(ctx, DiscoverTableColumnsQuery, unquote(schemas), unquote(tables))
+	if err != nil {
+		return nil, fmt.Errorf("discovering table columns: %w", err)
+	}
+	defer rows.Close()
+
+	tableColumns := SchemaTableColumns{}
+	for rows.Next() {
+		var schemaName, tableName, columnName string
+		if err := rows.Scan(&schemaName, &tableName, &columnName); err != nil {
+			return nil, fmt.Errorf("scanning table column: %w", err)
+		}
+		if _, found := tableColumns[schemaName]; !found {
+			tableColumns[schemaName] = map[string][]string{}
+		}
+		tableColumns[schemaName][tableName] = append(tableColumns[schemaName][tableName], columnName)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return tableColumns, nil
 }
 
 func ParseConfig(pgurl string) (*pgx.ConnConfig, error) {
@@ -296,16 +541,8 @@ func configureTCPKeepalive(cfg *pgx.ConnConfig) {
 
 	cfg.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		d := &net.Dialer{
-			Timeout: 90 * time.Second, // Timeout for establishing connection (allows for branch wake-up)
-			// KeepAliveConfig uses Go defaults:
-			// - Idle: 15s, Interval: 15s, Count: 9
-			// This gives ~150s detection time for broken connections
-			KeepAliveConfig: net.KeepAliveConfig{
-				Enable:   true,
-				Idle:     15 * time.Second,
-				Interval: 15 * time.Second,
-				Count:    9,
-			},
+			Timeout:         dialTimeout, // Timeout for establishing connection (allows for branch wake-up)
+			KeepAliveConfig: keepAliveConfig(),
 		}
 
 		conn, err := d.DialContext(ctx, network, addr)
@@ -315,4 +552,70 @@ func configureTCPKeepalive(cfg *pgx.ConnConfig) {
 
 		return conn, nil
 	}
+}
+
+// dialTimeout bounds a single TCP dial.
+const dialTimeout = 90 * time.Second
+
+// keepAliveConfig returns the TCP keepalive settings every pgstream connection
+// uses. KeepAliveConfig uses Go defaults: Idle 15s, Interval 15s, Count 9,
+// which gives ~150s detection time for broken connections.
+func keepAliveConfig() net.KeepAliveConfig {
+	return net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     15 * time.Second,
+		Interval: 15 * time.Second,
+		Count:    9,
+	}
+}
+
+// applyTCPKeepalive puts pgstream's keepalive settings on an already open
+// connection, so a connection opened by a caller-supplied dialler is detected
+// as broken on the same timescale as one pgstream dialled itself. A connection
+// that is not TCP carries no keepalive settings and is left alone.
+func applyTCPKeepalive(conn net.Conn) error {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return nil
+	}
+	return tcp.SetKeepAliveConfig(keepAliveConfig())
+}
+
+// NewArrayTypeMap returns a type map that can decode and encode values of
+// arrayOID in the text format.
+//
+// A transformer that runs on array elements cannot use a bare pgtype.Map: that
+// map only knows the built-in OIDs, so a user-defined array type - an enum
+// array, citext[], hstore[], a domain over an array - fails to scan at run
+// time even though the rule validated. Such an element type is registered with
+// the text codec, which is what the server sends in the text format anyway,
+// and the array type is registered around it.
+//
+// json and jsonb keep the raw text decoding that connections use, so an
+// element reaches the transformer as raw text on both the replication and the
+// snapshot path, and a JSON null stays distinguishable from SQL NULL.
+//
+// It returns an error when the array type still cannot be resolved, so that an
+// unusable rule fails when it is built rather than on every row.
+func NewArrayTypeMap(arrayOID, elementOID uint32, elementTypeName string) (*pgtype.Map, error) {
+	typeMap := pgtype.NewMap()
+	registerRawJSONDecodingOnMap(typeMap)
+
+	if _, found := typeMap.TypeForOID(arrayOID); !found {
+		elementType, found := typeMap.TypeForOID(elementOID)
+		if !found {
+			elementType = &pgtype.Type{Name: elementTypeName, OID: elementOID, Codec: pgtype.TextCodec{}}
+			typeMap.RegisterType(elementType)
+		}
+		typeMap.RegisterType(&pgtype.Type{
+			Name:  "_" + elementTypeName,
+			OID:   arrayOID,
+			Codec: &pgtype.ArrayCodec{ElementType: elementType},
+		})
+	}
+
+	if _, found := typeMap.TypeForOID(arrayOID); !found {
+		return nil, fmt.Errorf("no codec for array type OID %d with element %s (OID %d)", arrayOID, elementTypeName, elementOID)
+	}
+	return typeMap, nil
 }

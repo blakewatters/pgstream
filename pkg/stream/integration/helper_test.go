@@ -10,12 +10,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/xataio/pgstream/internal/log/zerolog"
 	pglib "github.com/xataio/pgstream/internal/postgres"
+	"github.com/xataio/pgstream/internal/testcontainers"
 	"github.com/xataio/pgstream/pkg/backoff"
 	kafkalib "github.com/xataio/pgstream/pkg/kafka"
 	loglib "github.com/xataio/pgstream/pkg/log"
@@ -42,6 +44,7 @@ var (
 	pgurl            string
 	targetPGURL      string
 	kafkaBrokers     []string
+	kafkaSASLBrokers []string
 	opensearchURL    string
 	elasticsearchURL string
 )
@@ -49,6 +52,8 @@ var (
 const (
 	withGeneratedColumn = true
 )
+
+var integrationReplicationSlotCounter uint64
 
 type mockProcessor struct {
 	eventChan   chan *wal.Event
@@ -93,19 +98,39 @@ func (m *mockWebhookServer) close() {
 }
 
 func runStream(t *testing.T, ctx context.Context, cfg *stream.Config) {
-	// start the configured stream listener/processor
+	t.Helper()
+
+	done := make(chan error, 1)
 	go func() {
-		err := stream.Run(ctx, testLogger(), cfg, false, nil)
-		require.NoError(t, err)
+		done <- stream.Run(ctx, testLogger(), cfg, false, nil)
 	}()
+
+	t.Cleanup(func() {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Error("timeout waiting for stream to stop")
+		}
+	})
 }
 
 func runSnapshot(t *testing.T, ctx context.Context, cfg *stream.Config) {
-	// start the configured stream listener/processor
+	t.Helper()
+
+	done := make(chan error, 1)
 	go func() {
-		err := stream.Snapshot(ctx, testLogger(), cfg, nil)
-		require.NoError(t, err)
+		done <- stream.Snapshot(ctx, testLogger(), cfg, nil)
 	}()
+
+	t.Cleanup(func() {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Error("timeout waiting for snapshot to stop")
+		}
+	})
 }
 
 func initStream(t *testing.T, ctx context.Context, url string) {
@@ -135,15 +160,53 @@ func testLogger() loglib.Logger {
 	}))
 }
 
-func testPostgresListenerCfg() stream.ListenerConfig {
+func testPostgresListenerCfg(t *testing.T) stream.ListenerConfig {
+	t.Helper()
+
+	slotName := initReplicationSlotForTest(t, pgurl)
 	return stream.ListenerConfig{
 		Postgres: &stream.PostgresListenerConfig{
 			URL: pgurl,
 			Replication: pgreplication.Config{
-				PostgresURL: pgurl,
+				PostgresURL:         pgurl,
+				ReplicationSlotName: slotName,
 			},
 		},
 	}
+}
+
+func initReplicationSlotForTest(t *testing.T, url string) string {
+	t.Helper()
+
+	slotName := fmt.Sprintf("pgstream_it_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&integrationReplicationSlotCounter, 1))
+	require.NoError(t, stream.Init(context.Background(), &stream.InitConfig{
+		PostgresURL:         url,
+		ReplicationSlotName: slotName,
+	}))
+
+	t.Cleanup(func() {
+		dropReplicationSlotForTest(t, url, slotName)
+	})
+
+	return slotName
+}
+
+func dropReplicationSlotForTest(t *testing.T, url, slotName string) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		conn, err := pglib.NewConn(ctx, url)
+		if err != nil {
+			return false
+		}
+		defer conn.Close(ctx)
+
+		_, err = conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, slotName)
+		return err == nil
+	}, 10*time.Second, 200*time.Millisecond, "replication slot %s was not dropped", slotName)
 }
 
 func testPostgresListenerCfgWithSnapshot(sourceURL, targetURL string, tables []string) stream.ListenerConfig {
@@ -231,11 +294,27 @@ func withBulkIngestionEnabled() option {
 	}
 }
 
+func withTransformerRules(rules []transformer.TableRules) option {
+	return func(cfg *stream.ProcessorConfig) {
+		cfg.Transformer = &transformer.Config{TransformerRules: rules}
+	}
+}
+
+func testPostgresListenerCfgWithSnapshotAndFilter(sourceURL, targetURL string, tables []string, includeObjectTypes []string) stream.ListenerConfig {
+	cfg := testPostgresListenerCfgWithSnapshot(sourceURL, targetURL, tables)
+	cfg.Postgres.Snapshot.Schema.DumpRestore.IncludeObjectTypes = includeObjectTypes
+	return cfg
+}
+
 func testPostgresProcessorCfg(opts ...option) stream.ProcessorConfig {
+	return testPostgresProcessorCfgWithTargetURL(targetPGURL, opts...)
+}
+
+func testPostgresProcessorCfgWithTargetURL(targetURL string, opts ...option) stream.ProcessorConfig {
 	cfg := stream.ProcessorConfig{
 		Postgres: &stream.PostgresProcessorConfig{
 			BatchWriter: postgres.Config{
-				URL: targetPGURL,
+				URL: targetURL,
 				BatchConfig: batch.Config{
 					MaxBatchSize: 1,
 					// BatchTimeout: 50 * time.Millisecond,
@@ -269,6 +348,31 @@ func testPostgresProcessorCfgWithTransformer(sourcePGURL string) stream.Processo
 		},
 		Transformer: &transformer.Config{
 			TransformerRules: testTransformationRules(),
+		},
+	}
+}
+
+// kafkaSASLUser is the only user the SASL enabled broker accepts, over any of
+// the supported mechanisms.
+var kafkaSASLUser = testcontainers.SASLUser{
+	Username: "pgstream",
+	Password: "pgstream-secret",
+}
+
+// testKafkaSASLCfg points at the SASL enabled broker, with a topic of its own
+// so that a run for one mechanism cannot read what a run for another wrote.
+func testKafkaSASLCfg(topic, mechanism string, user testcontainers.SASLUser) kafkalib.ConnConfig {
+	return kafkalib.ConnConfig{
+		Servers: kafkaSASLBrokers,
+		Topic: kafkalib.TopicConfig{
+			Name:       topic,
+			AutoCreate: true,
+		},
+		SASL: kafkalib.SASLConfig{
+			Enabled:   true,
+			Mechanism: mechanism,
+			Username:  user.Username,
+			Password:  user.Password,
 		},
 	}
 }

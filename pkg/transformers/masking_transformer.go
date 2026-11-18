@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/ggwhite/go-masker"
 )
@@ -31,6 +32,7 @@ var (
 		"type must be one of 'custom', 'password', 'name', 'address', 'email', 'mobile', 'tel', 'id', 'credit_card', 'url' or 'default'",
 	)
 	errMaskUnmaskCannotBeUsedTogether = errors.New("masking: mask and unmask parameters cannot be used together")
+	errMaskCoversNoCharacters         = errors.New("masking: the configured mask covers no characters and would leave values unmasked; use the noop transformer if passthrough is intended")
 	maskingCompatibleTypes            = []SupportedDataType{
 		StringDataType,
 		ByteArrayDataType,
@@ -119,7 +121,7 @@ func NewMaskingTransformer(params ParameterValues) (*MaskingTransformer, error) 
 		}
 	case mDefault:
 		mf = func(v string) string {
-			return strings.Repeat("*", len(v))
+			return strings.Repeat("*", utf8.RuneCountInString(v))
 		}
 	default:
 		return nil, errInvalidMaskingType
@@ -159,10 +161,15 @@ func (t *MaskingTransformer) IsDynamic() bool {
 	return false
 }
 
+func (t *MaskingTransformer) Uniqueness() Uniqueness {
+	return UniquenessLossy
+}
+
 func MaskingTransformerDefinition() *Definition {
 	return &Definition{
 		SupportedTypes: maskingCompatibleTypes,
 		Parameters:     maskingParams,
+		Uniqueness:     UniquenessLossy,
 	}
 }
 
@@ -218,9 +225,16 @@ func getCustomMaskingFn(params ParameterValues) (maskingFunction, error) {
 			return nil, fmt.Errorf("masking: unable to read mask_end: %w", err)
 		}
 	}
+	// a mask covering no characters leaves values unmasked, which silently
+	// defeats anonymization; noop is the way to pass a column through
+	if masksNothing(mask, begin, beginAbs, end, endAbs) {
+		return nil, errMaskCoversNoCharacters
+	}
+
 	return func(v string) string {
 		var beginIndex, endIndex int
-		length := len(v)
+		// index by characters, not bytes, so multi-byte characters are never split
+		length := utf8.RuneCountInString(v)
 
 		if beginAbs {
 			beginIndex = getIntegerInRange(begin, 0, length)
@@ -237,11 +251,37 @@ func getCustomMaskingFn(params ParameterValues) (maskingFunction, error) {
 			beginIndex, endIndex = endIndex, beginIndex
 		}
 
-		if mask {
-			return v[:beginIndex] + strings.Repeat("*", endIndex-beginIndex) + v[endIndex:]
+		beginOffset, endOffset := beginIndex, endIndex
+		if length != len(v) {
+			beginOffset = runeByteOffset(v, beginIndex)
+			endOffset = beginOffset + runeByteOffset(v[beginOffset:], endIndex-beginIndex)
 		}
-		return strings.Repeat("*", beginIndex) + v[beginIndex:endIndex] + strings.Repeat("*", length-endIndex)
+
+		if mask {
+			return v[:beginOffset] + strings.Repeat("*", endIndex-beginIndex) + v[endOffset:]
+		}
+		return strings.Repeat("*", beginIndex) + v[beginOffset:endOffset] + strings.Repeat("*", length-endIndex)
 	}, nil
+}
+
+// runeByteOffset returns the byte offset of the character at index n. An
+// invalid UTF-8 byte counts as one character, so the offset never changes the
+// bytes of the input.
+func runeByteOffset(v string, n int) int {
+	for offset := range v {
+		if n == 0 {
+			return offset
+		}
+		n--
+	}
+	return len(v)
+}
+
+func masksNothing(mask bool, begin int, beginAbs bool, end int, endAbs bool) bool {
+	if mask {
+		return beginAbs == endAbs && begin == end
+	}
+	return begin <= 0 && !endAbs && end >= 100
 }
 
 func getIntegerInRange(v, min, max int) int {

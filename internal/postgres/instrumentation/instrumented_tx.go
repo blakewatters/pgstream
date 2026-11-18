@@ -4,9 +4,11 @@ package instrumentation
 
 import (
 	"context"
+	"io"
 
 	pglib "github.com/xataio/pgstream/internal/postgres"
 	"github.com/xataio/pgstream/pkg/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -47,8 +49,37 @@ func (i *Tx) Exec(ctx context.Context, query string, args ...any) (tag pglib.Com
 	return i.inner.Exec(ctx, query, args...)
 }
 
+func (i *Tx) ExecBatch(ctx context.Context, queries []pglib.BatchQuery) (err error) {
+	// One span for the batch. The queries go in one exchange, so a span for
+	// each query would show the same start and end time for all of them.
+	ctx, span := otel.StartSpan(ctx, i.tracer, "tx.ExecBatch",
+		trace.WithAttributes(attribute.Int("batch.size", len(queries))))
+	defer otel.CloseSpan(span, err)
+	return i.inner.ExecBatch(ctx, queries)
+}
+
 func (i *Tx) CopyFrom(ctx context.Context, tableName string, columnNames []string, srcRows [][]any) (rowCount int64, err error) {
 	ctx, span := otel.StartSpan(ctx, i.tracer, "tx.CopyFrom")
 	defer otel.CloseSpan(span, err)
 	return i.inner.CopyFrom(ctx, tableName, columnNames, srcRows)
+}
+
+func (i *Tx) CopyFromText(ctx context.Context, tableName string, columnNames []string, srcRows [][]any) (rowCount int64, err error) {
+	ctx, span := otel.StartSpan(ctx, i.tracer, "tx.CopyFromText")
+	defer otel.CloseSpan(span, err)
+	return i.inner.CopyFromText(ctx, tableName, columnNames, srcRows)
+}
+
+func (i *Tx) CopyToWriter(ctx context.Context, w io.Writer, sql string) (rowCount int64, err error) {
+	queryAttrs := queryAttributes(sql)
+	ctx, span := otel.StartSpan(ctx, i.tracer, "tx.CopyToWriter", trace.WithAttributes(queryAttrs...))
+	defer otel.CloseSpan(span, err)
+	return i.inner.CopyToWriter(ctx, w, sql)
+}
+
+func (i *Tx) CopyFromReader(ctx context.Context, r io.Reader, sql string) (rowCount int64, err error) {
+	queryAttrs := queryAttributes(sql)
+	ctx, span := otel.StartSpan(ctx, i.tracer, "tx.CopyFromReader", trace.WithAttributes(queryAttrs...))
+	defer otel.CloseSpan(span, err)
+	return i.inner.CopyFromReader(ctx, r, sql)
 }

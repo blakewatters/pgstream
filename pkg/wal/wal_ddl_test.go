@@ -5,8 +5,98 @@ package wal
 import (
 	"testing"
 
+	jsonlib "github.com/xataio/pgstream/internal/json"
+
 	"github.com/stretchr/testify/require"
 )
+
+const testDDLContent = `{
+	"ddl": "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)",
+	"schema_name": "public",
+	"command_tag": "CREATE TABLE",
+	"objects": [{
+		"type": "table",
+		"identity": "public.users",
+		"schema": "public",
+		"oid": "16384",
+		"pgstream_id": "ck7s8u4000001"
+	}]
+}`
+
+func TestWalDataToDDLEvent_memoisation(t *testing.T) {
+	t.Parallel()
+
+	data := &Data{
+		Action:  "M",
+		Prefix:  "pgstream.ddl",
+		Content: testDDLContent,
+	}
+
+	first, err := WalDataToDDLEvent(data)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+
+	second, err := WalDataToDDLEvent(data)
+	require.NoError(t, err)
+
+	// repeat calls must return the exact same cached pointer, i.e. the content
+	// is parsed only once.
+	require.Same(t, first, second)
+
+	// the error path is memoised too.
+	notDDL := &Data{Action: "I"}
+	_, err1 := WalDataToDDLEvent(notDDL)
+	_, err2 := WalDataToDDLEvent(notDDL)
+	require.ErrorIs(t, err1, ErrNotDDLEvent)
+	require.ErrorIs(t, err2, ErrNotDDLEvent)
+}
+
+func BenchmarkWalDataToDDLEvent_memoised(b *testing.B) {
+	data := &Data{
+		Action:  "M",
+		Prefix:  "pgstream.ddl",
+		Content: testDDLContent,
+	}
+	// prime the memo so the benchmarked calls only hit the cached fast path.
+	if _, err := WalDataToDDLEvent(data); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := WalDataToDDLEvent(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestWalDataToDDLEvent_serialisationUnaffected(t *testing.T) {
+	t.Parallel()
+
+	// a Data whose DDL event has been memoised must serialise byte-identically
+	// to one that has not: the memo fields are unexported and excluded from JSON.
+	plain := &Data{
+		Action:  "M",
+		Prefix:  "pgstream.ddl",
+		Content: testDDLContent,
+		Schema:  "public",
+	}
+	memoised := &Data{
+		Action:  "M",
+		Prefix:  "pgstream.ddl",
+		Content: testDDLContent,
+		Schema:  "public",
+	}
+	_, err := WalDataToDDLEvent(memoised)
+	require.NoError(t, err)
+
+	plainBytes, err := jsonlib.Marshal(plain)
+	require.NoError(t, err)
+	memoisedBytes, err := jsonlib.Marshal(memoised)
+	require.NoError(t, err)
+
+	require.Equal(t, plainBytes, memoisedBytes)
+}
 
 func TestData_IsDDLEvent(t *testing.T) {
 	t.Parallel()
@@ -362,6 +452,36 @@ func TestDDLEvent_GetTableObjectByName(t *testing.T) {
 			t.Parallel()
 			got := ddlEvent.GetTableObjectByName(tt.schema, tt.table)
 			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestDDLColumn_HasSequence(t *testing.T) {
+	t.Parallel()
+
+	nextval := "nextval('public.t_id_seq'::regclass)"
+	now := "now()"
+	always := "ALWAYS"
+
+	tests := []struct {
+		name string
+		col  DDLColumn
+
+		wantHasSequence  bool
+		wantSequenceName string
+	}{
+		{name: "serial column", col: DDLColumn{Default: &nextval}, wantHasSequence: true, wantSequenceName: "public.t_id_seq"},
+		// the DDL event does not carry the name of an identity sequence
+		{name: "identity column", col: DDLColumn{Identity: &always}, wantHasSequence: true, wantSequenceName: ""},
+		{name: "other default", col: DDLColumn{Default: &now}, wantHasSequence: false, wantSequenceName: ""},
+		{name: "no default", col: DDLColumn{}, wantHasSequence: false, wantSequenceName: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.wantHasSequence, tc.col.HasSequence())
+			require.Equal(t, tc.wantSequenceName, tc.col.GetSequenceName())
 		})
 	}
 }

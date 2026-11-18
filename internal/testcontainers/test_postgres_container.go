@@ -17,15 +17,17 @@ type cleanup func() error
 type PostgresImage string
 
 const (
-	Postgres14 PostgresImage = "debezium/postgres:14-alpine"
-	Postgres17 PostgresImage = "debezium/postgres:17-alpine"
+	Postgres14         PostgresImage = "debezium/postgres:14-alpine"
+	Postgres17         PostgresImage = "debezium/postgres:17-alpine"
+	PgvectorPostgres17 PostgresImage = "pgvector/pgvector:pg17"
+	PostgisPostgres17  PostgresImage = "postgis/postgis:17-3.5"
 )
 
 func SetupPostgresContainer(ctx context.Context, url *string, image PostgresImage, configFile ...string) (cleanup, error) {
 	waitForLogs := wait.
 		ForLog("database system is ready to accept connections").
 		WithOccurrence(2).
-		WithStartupTimeout(5 * time.Second)
+		WithStartupTimeout(2 * time.Minute)
 
 	opts := []testcontainers.ContainerCustomizer{
 		testcontainers.WithWaitStrategy(waitForLogs),

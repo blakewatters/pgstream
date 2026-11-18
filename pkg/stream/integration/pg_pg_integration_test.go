@@ -6,12 +6,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	pglib "github.com/xataio/pgstream/internal/postgres"
-	"github.com/xataio/pgstream/internal/testcontainers"
 	"github.com/xataio/pgstream/pkg/stream"
 )
 
@@ -38,7 +38,7 @@ func Test_PostgresToPostgres(t *testing.T) {
 	}
 
 	cfg := &stream.Config{
-		Listener:  testPostgresListenerCfg(),
+		Listener:  testPostgresListenerCfg(t),
 		Processor: testPostgresProcessorCfg(),
 	}
 
@@ -223,98 +223,13 @@ func Test_PostgresToPostgres(t *testing.T) {
 	}
 }
 
-func Test_PostgresToPostgres_Snapshot(t *testing.T) {
-	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
-		t.Skip("skipping integration test...")
-	}
-
-	// postgres container where pgstream hasn't been initialised to be used for
-	// initial snapshot validation
-	var snapshotPGURL string
-	pgcleanup, err := testcontainers.SetupPostgresContainer(context.Background(), &snapshotPGURL, testcontainers.Postgres14, "config/postgresql.conf")
-	require.NoError(t, err)
-	defer pgcleanup()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	testTable := "pg2pg_snapshot_integration_test"
-	// create table and populate it before initialising and running pgstream to
-	// ensure the snapshot captures pre-existing schema and data properly
-	execQueryWithURL(t, ctx, snapshotPGURL, fmt.Sprintf("create table %s(id serial primary key, name text)", testTable))
-	execQueryWithURL(t, ctx, snapshotPGURL, fmt.Sprintf("insert into %s(name) values('a'),('b')", testTable))
-	execQueryWithURL(t, ctx, snapshotPGURL, "create role test_role;")
-	// grant some privileges to the role to ensure these are captured in the snapshot
-	execQueryWithURL(t, ctx, snapshotPGURL, fmt.Sprintf("grant select on %s to test_role", testTable))
-
-	cfg := &stream.Config{
-		Listener:  testPostgresListenerCfgWithSnapshot(snapshotPGURL, targetPGURL, []string{testTable}),
-		Processor: testPostgresProcessorCfg(),
-	}
-	initStream(t, ctx, snapshotPGURL)
-	runStream(t, ctx, cfg)
-
-	targetConn, err := pglib.NewConn(ctx, targetPGURL)
-	require.NoError(t, err)
-
-	timer := time.NewTimer(20 * time.Second)
-	defer timer.Stop()
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	validation := func() bool {
-		schemaColumns := getInformationSchemaColumns(t, ctx, targetConn, testTable)
-		if len(schemaColumns) != 2 {
-			return false
-		}
-
-		wantSchemaCols := []*informationSchemaColumn{
-			{name: "id", dataType: "integer", isNullable: "NO"},
-			{name: "name", dataType: "text", isNullable: "YES"},
-		}
-		require.ElementsMatch(t, wantSchemaCols, schemaColumns)
-
-		columns := getTestTableColumns(t, ctx, targetConn, fmt.Sprintf("select id,name from %s", testTable))
-		if len(columns) != 2 {
-			return false
-		}
-
-		wantCols := []*testTableColumn{
-			{id: 1, name: "a"},
-			{id: 2, name: "b"},
-		}
-		require.ElementsMatch(t, wantCols, columns)
-
-		roles := getRoles(t, ctx, targetConn)
-		if len(roles) < 1 {
-			return false
-		}
-		require.Contains(t, roles, "test_role")
-
-		return true
-	}
-
-	for {
-		select {
-		case <-timer.C:
-			cancel()
-			t.Error("timeout waiting for postgres snapshot sync")
-			return
-		case <-ticker.C:
-			if validation() {
-				return
-			}
-		}
-	}
-}
-
 func Test_PostgresToPostgres_IndexesAndConstraints(t *testing.T) {
 	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
 		t.Skip("skipping integration test...")
 	}
 
 	cfg := &stream.Config{
-		Listener:  testPostgresListenerCfg(),
+		Listener:  testPostgresListenerCfg(t),
 		Processor: testPostgresProcessorCfg(),
 	}
 
@@ -416,13 +331,85 @@ func Test_PostgresToPostgres_IndexesAndConstraints(t *testing.T) {
 	}, 20*time.Second, 200*time.Millisecond)
 }
 
+func Test_PostgresToPostgres_UnqualifiedDDLUnderSearchPath(t *testing.T) {
+	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
+		t.Skip("skipping integration test...")
+	}
+
+	cfg := &stream.Config{
+		Listener:  testPostgresListenerCfg(t),
+		Processor: testPostgresProcessorCfg(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runStream(t, ctx, cfg)
+
+	suffix := time.Now().UnixNano()
+	schemaName := fmt.Sprintf("pg2pg_search_path_%d", suffix)
+	tableName := fmt.Sprintf("pg2pg_unqualified_%d", suffix)
+	domainName := fmt.Sprintf("pg2pg_code_%d", suffix)
+
+	// CREATE SCHEMA does not replicate, so create it twice.
+	execQuery(t, ctx, fmt.Sprintf("create schema %s", schemaName))
+	execQueryWithURL(t, ctx, targetPGURL, fmt.Sprintf("create schema %s", schemaName))
+	defer execQueryWithURL(t, ctx, targetPGURL, fmt.Sprintf("drop schema if exists %s cascade", schemaName))
+	defer execQuery(t, ctx, fmt.Sprintf("drop schema if exists %s cascade", schemaName))
+
+	sourceConn, err := pglib.NewConn(ctx, pgurl)
+	require.NoError(t, err)
+	defer sourceConn.Close(ctx)
+
+	targetConn, err := pglib.NewConn(ctx, targetPGURL)
+	require.NoError(t, err)
+	defer targetConn.Close(ctx)
+
+	// The domain in public must resolve during unqualified DDL replay.
+	execQuery(t, ctx, fmt.Sprintf("create domain public.%s as text", domainName))
+	defer execQueryWithURL(t, ctx, targetPGURL, fmt.Sprintf("drop domain if exists public.%s cascade", domainName))
+	defer execQuery(t, ctx, fmt.Sprintf("drop domain if exists public.%s cascade", domainName))
+	require.Eventually(t, func() bool {
+		// a failed probe is just "not yet" while polling; the exclusion
+		// assertion below is the one that has to tell an error from an absence
+		exists, err := pgTypeExists(ctx, targetConn, "public", domainName)
+		return err == nil && exists
+	}, 20*time.Second, 200*time.Millisecond, "expected the domain to be replicated to the target")
+
+	// The unqualified DDL relies on the session search path.
+	_, err = sourceConn.Exec(ctx, fmt.Sprintf("set search_path to %s, public", schemaName))
+	require.NoError(t, err)
+	_, err = sourceConn.Exec(ctx, fmt.Sprintf("create table %s (id int primary key, code %s)", tableName, domainName))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		exists, err := tableExists(ctx, targetConn, schemaName, tableName)
+		return err == nil && exists
+	}, 20*time.Second, 200*time.Millisecond, "expected table to be created on the upstream schema")
+
+	publicTableExists, err := tableExists(ctx, targetConn, "public", tableName)
+	require.NoError(t, err)
+	require.False(t, publicTableExists,
+		"expected table not to be created on the target default schema")
+
+	// The following DML is schema qualified by WAL decoding.
+	_, err = sourceConn.Exec(ctx, fmt.Sprintf("insert into %s values (1)", tableName))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		var count int
+		err := targetConn.QueryRow(ctx, []any{&count},
+			fmt.Sprintf("select count(*) from %s.%s", schemaName, tableName))
+		return err == nil && count == 1
+	}, 20*time.Second, 200*time.Millisecond, "expected the inserted row to be replicated")
+}
+
 func Test_PostgresToPostgres_IdentityColumns(t *testing.T) {
 	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
 		t.Skip("skipping integration test...")
 	}
 
 	cfg := &stream.Config{
-		Listener:  testPostgresListenerCfg(),
+		Listener:  testPostgresListenerCfg(t),
 		Processor: testPostgresProcessorCfg(),
 	}
 
@@ -555,8 +542,169 @@ func Test_PostgresToPostgres_IdentityColumns(t *testing.T) {
 		return sourceSeqValue == 3 && targetSeqValue == 3
 	}, 20*time.Second, 200*time.Millisecond)
 
+	// An explicit id on the source must keep the same value on the target, and
+	// the target sequence must follow it.
+	execQuery(t, ctx, fmt.Sprintf("INSERT INTO %s(id, name) OVERRIDING SYSTEM VALUE VALUES(100, 'Dave')", testTable))
+
+	require.Eventually(t, func() bool {
+		var targetSeqValue int64
+		var name string
+		if err := targetConn.QueryRow(ctx, []any{&name}, fmt.Sprintf("SELECT name FROM %s WHERE id = 100", testTable)); err != nil {
+			return false
+		}
+		require.Equal(t, "Dave", name)
+
+		err := targetConn.QueryRow(ctx, []any{&targetSeqValue}, fmt.Sprintf("SELECT last_value FROM %s", sequenceName))
+		require.NoError(t, err)
+		return targetSeqValue == 100
+	}, 20*time.Second, 200*time.Millisecond)
+
 	// Clean up
 	execQuery(t, ctx, fmt.Sprintf("DROP TABLE %s", testTable))
+}
+
+// Test_PostgresToPostgres_IdentitySequenceOnExistingTable verifies that the
+// target identity sequence follows the replicated inserts when the table
+// exists on both sides before the stream starts (for example after a snapshot
+// or a restart). The stream receives no CREATE TABLE event, so the schema
+// observer reads the sequence columns from the target catalog.
+func Test_PostgresToPostgres_IdentitySequenceOnExistingTable(t *testing.T) {
+	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
+		t.Skip("skipping integration test...")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testTable := fmt.Sprintf("pg2pg_existing_identity_%d", time.Now().UnixNano())
+	for _, url := range []string{pgurl, targetPGURL} {
+		execQueryWithURL(t, ctx, url, fmt.Sprintf(
+			`CREATE TABLE %s (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text)`, testTable))
+	}
+	t.Cleanup(func() {
+		// cleanup runs after the deferred cancel(), so it needs a live context.
+		for _, url := range []string{pgurl, targetPGURL} {
+			execQueryWithURL(t, context.Background(), url, fmt.Sprintf("DROP TABLE IF EXISTS %s", testTable))
+		}
+	})
+
+	// the replication slot is created after the table, so the stream does not
+	// receive the CREATE TABLE event.
+	cfg := &stream.Config{
+		Listener:  testPostgresListenerCfg(t),
+		Processor: testPostgresProcessorCfg(),
+	}
+	runStream(t, ctx, cfg)
+
+	execQuery(t, ctx, fmt.Sprintf("INSERT INTO %s(name) VALUES('Alice'), ('Bob')", testTable))
+
+	targetConn, err := pglib.NewConn(ctx, targetPGURL)
+	require.NoError(t, err)
+	defer targetConn.Close(ctx)
+
+	var sequenceName string
+	err = targetConn.QueryRow(ctx, []any{&sequenceName}, `SELECT pg_get_serial_sequence($1, 'id')`, testTable)
+	require.NoError(t, err)
+	require.NotEmpty(t, sequenceName)
+
+	require.Eventually(t, func() bool {
+		var lastValue int64
+		var isCalled bool
+		err := targetConn.QueryRow(ctx, []any{&lastValue, &isCalled}, fmt.Sprintf("SELECT last_value, is_called FROM %s", sequenceName))
+		require.NoError(t, err)
+		return lastValue == 2 && isCalled
+	}, 20*time.Second, 200*time.Millisecond)
+
+	// a write on the target uses the next identity value instead of a
+	// replicated one.
+	execQueryWithURL(t, ctx, targetPGURL, fmt.Sprintf("INSERT INTO %s(name) VALUES('Charlie')", testTable))
+}
+
+// Test_PostgresToPostgres_AlwaysIdentityUpdate verifies that UPDATE events on a
+// table with a GENERATED ALWAYS AS IDENTITY column are replicated successfully.
+// Postgres rejects UPDATE ... SET <always-identity-col> = <value> with
+// "column can only be updated to DEFAULT", so the column must be filtered out
+// of the SET clause on the target.
+func Test_PostgresToPostgres_AlwaysIdentityUpdate(t *testing.T) {
+	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
+		t.Skip("skipping integration test...")
+	}
+
+	cfg := &stream.Config{
+		Listener:  testPostgresListenerCfg(t),
+		Processor: testPostgresProcessorCfg(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetConn, err := pglib.NewConn(ctx, targetPGURL)
+	require.NoError(t, err)
+	defer targetConn.Close(ctx)
+
+	runStream(t, ctx, cfg)
+
+	testTable := "pg2pg_always_identity_update_test"
+	defer execQuery(t, ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", testTable))
+
+	// Table has a separate primary key plus a GENERATED ALWAYS AS IDENTITY
+	// column. UPDATEs on `name` must not include `request_id` in the SET
+	// clause, or Postgres rejects them.
+	execQuery(t, ctx, fmt.Sprintf(`
+		CREATE TABLE %s (
+			id bigint PRIMARY KEY,
+			request_id bigint GENERATED ALWAYS AS IDENTITY,
+			name text
+		)
+	`, testTable))
+
+	// Wait for the table schema to land on the target before querying it.
+	require.Eventually(t, func() bool {
+		columns := getInformationSchemaColumns(t, ctx, targetConn, testTable)
+		return len(columns) == 3
+	}, 20*time.Second, 200*time.Millisecond, "table schema not replicated")
+
+	execQuery(t, ctx, fmt.Sprintf("INSERT INTO %s(id, name) VALUES(1, 'Alice')", testTable))
+	execQuery(t, ctx, fmt.Sprintf("INSERT INTO %s(id, name) VALUES(2, 'Bob')", testTable))
+
+	require.Eventually(t, func() bool {
+		rows := getIDNameRows(t, ctx, targetConn,
+			fmt.Sprintf("SELECT id, name FROM %s ORDER BY id", testTable))
+		return len(rows) == 2 && rows[0].name == "Alice" && rows[1].name == "Bob"
+	}, 20*time.Second, 200*time.Millisecond, "initial inserts not replicated")
+
+	// Capture the original request_id values on the target so we can verify
+	// they are preserved across the UPDATE (since the SET clause must not
+	// touch the always-identity column).
+	var aliceReqIDBefore, bobReqIDBefore int64
+	err = targetConn.QueryRow(ctx, []any{&aliceReqIDBefore},
+		fmt.Sprintf("SELECT request_id FROM %s WHERE id = 1", testTable))
+	require.NoError(t, err)
+	err = targetConn.QueryRow(ctx, []any{&bobReqIDBefore},
+		fmt.Sprintf("SELECT request_id FROM %s WHERE id = 2", testTable))
+	require.NoError(t, err)
+
+	// Perform UPDATEs that, pre-fix, produced
+	// "column \"request_id\" can only be updated to DEFAULT" on the target.
+	execQuery(t, ctx, fmt.Sprintf("UPDATE %s SET name = 'Alice2' WHERE id = 1", testTable))
+	execQuery(t, ctx, fmt.Sprintf("UPDATE %s SET name = 'Bob2' WHERE id = 2", testTable))
+
+	require.Eventually(t, func() bool {
+		rows := getIDNameRows(t, ctx, targetConn,
+			fmt.Sprintf("SELECT id, name FROM %s ORDER BY id", testTable))
+		return len(rows) == 2 && rows[0].name == "Alice2" && rows[1].name == "Bob2"
+	}, 20*time.Second, 200*time.Millisecond, "UPDATE not replicated — likely rejected by always-identity rule")
+
+	var aliceReqIDAfter, bobReqIDAfter int64
+	err = targetConn.QueryRow(ctx, []any{&aliceReqIDAfter},
+		fmt.Sprintf("SELECT request_id FROM %s WHERE id = 1", testTable))
+	require.NoError(t, err)
+	err = targetConn.QueryRow(ctx, []any{&bobReqIDAfter},
+		fmt.Sprintf("SELECT request_id FROM %s WHERE id = 2", testTable))
+	require.NoError(t, err)
+
+	require.Equal(t, aliceReqIDBefore, aliceReqIDAfter, "request_id should be unchanged by UPDATE")
+	require.Equal(t, bobReqIDBefore, bobReqIDAfter, "request_id should be unchanged by UPDATE")
 }
 
 func Test_PostgresToPostgres_Sequences(t *testing.T) {
@@ -565,7 +713,7 @@ func Test_PostgresToPostgres_Sequences(t *testing.T) {
 	}
 
 	cfg := &stream.Config{
-		Listener:  testPostgresListenerCfg(),
+		Listener:  testPostgresListenerCfg(t),
 		Processor: testPostgresProcessorCfg(),
 	}
 
@@ -859,4 +1007,280 @@ func getRoles(t *testing.T, ctx context.Context, conn pglib.Querier) []string {
 	require.NoError(t, rows.Err())
 
 	return roles
+}
+
+// Test_PostgresToPostgres_LargeIntegerPrecisionWAL is the WAL-replication
+// counterpart of Test_SnapshotToPostgres_LargeIntegerPrecision. It pins down
+// that INSERT / UPDATE events carrying large integers — both as plain bigint
+// column values and as integer fields inside a jsonb payload — replicate
+// bit-for-bit through the wal2json → listener → target path.
+//
+// Covers the WAL side of #824 (bigint) and #686 (jsonb large int).
+func Test_PostgresToPostgres_LargeIntegerPrecisionWAL(t *testing.T) {
+	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
+		t.Skip("skipping integration test...")
+	}
+
+	cfg := &stream.Config{
+		Listener:  testPostgresListenerCfg(t),
+		Processor: testPostgresProcessorCfg(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runStream(t, ctx, cfg)
+
+	testTable := "pg2pg_largeint_wal"
+
+	// 9007199254740993 = 2^53 + 1, the smallest int64 that float64 cannot
+	// represent exactly. 9223372036854775807 is MaxInt64.
+	execQuery(t, ctx, fmt.Sprintf(
+		`CREATE TABLE %s(
+			id      bigint PRIMARY KEY,
+			amount  bigint NOT NULL,
+			payload jsonb  NOT NULL
+		)`, testTable))
+
+	type row struct {
+		id      int64
+		amount  int64
+		payload string
+	}
+
+	targetConn, err := pglib.NewConn(ctx, targetPGURL)
+	require.NoError(t, err)
+
+	fetch := func() ([]row, error) {
+		rows, err := targetConn.Query(ctx,
+			fmt.Sprintf("SELECT id, amount, payload::text FROM %s ORDER BY id", testTable))
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out := []row{}
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.amount, &r.payload); err != nil {
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		return out, rows.Err()
+	}
+
+	waitFor := func(want []row) {
+		t.Helper()
+		timer := time.NewTimer(20 * time.Second)
+		defer timer.Stop()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-timer.C:
+				cancel()
+				t.Fatalf("timeout waiting for WAL replication; last fetch did not match %v", want)
+			case <-ticker.C:
+				got, err := fetch()
+				if err != nil || len(got) != len(want) {
+					continue
+				}
+				if reflect.DeepEqual(got, want) {
+					require.Equal(t, want, got)
+					return
+				}
+			}
+		}
+	}
+
+	t.Run("insert bigint above 2^53 + jsonb with large int", func(t *testing.T) {
+		execQuery(t, ctx, fmt.Sprintf(
+			`INSERT INTO %s(id, amount, payload) VALUES
+				(9007199254740993,    9007199254740993,    '{"n":9007199254740993}'),
+				(9223372036854775807, 9223372036854775807, '{"n":9223372036854775807,"nested":{"k":1234567890123456789}}')`,
+			testTable))
+
+		waitFor([]row{
+			{id: 9007199254740993, amount: 9007199254740993, payload: `{"n": 9007199254740993}`},
+			{id: 9223372036854775807, amount: 9223372036854775807, payload: `{"n": 9223372036854775807, "nested": {"k": 1234567890123456789}}`},
+		})
+	})
+
+	t.Run("update jsonb payload with new large int", func(t *testing.T) {
+		execQuery(t, ctx, fmt.Sprintf(
+			`UPDATE %s
+			    SET payload = jsonb_set(payload, '{k2}', '987654321987654321'::jsonb)
+			  WHERE id = 9223372036854775807`,
+			testTable))
+
+		// jsonb stores keys ordered by length then alphabetically, so
+		// `n` (1) before `k2` (2) before `nested` (6).
+		waitFor([]row{
+			{id: 9007199254740993, amount: 9007199254740993, payload: `{"n": 9007199254740993}`},
+			{id: 9223372036854775807, amount: 9223372036854775807, payload: `{"n": 9223372036854775807, "k2": 987654321987654321, "nested": {"k": 1234567890123456789}}`},
+		})
+	})
+
+	t.Run("update bigint above 2^53 by +1", func(t *testing.T) {
+		// The repro from #824: incrementing a bigint above 2^53 must
+		// land on the destination as exactly source+1, not source+0.
+		execQuery(t, ctx, fmt.Sprintf(
+			`UPDATE %s SET amount = amount + 1 WHERE id = 9007199254740993`,
+			testTable))
+
+		waitFor([]row{
+			{id: 9007199254740993, amount: 9007199254740994, payload: `{"n": 9007199254740993}`},
+			{id: 9223372036854775807, amount: 9223372036854775807, payload: `{"n": 9223372036854775807, "k2": 987654321987654321, "nested": {"k": 1234567890123456789}}`},
+		})
+	})
+}
+
+// Test_PostgresToPostgres_EnumPrimaryKeyDelete verifies that replicated DELETE
+// events on a table whose replica identity contains a user-defined enum column
+// are applied on the target.
+//
+// The repro from #1037: BatchWriter.buildCoalescedQueries routes every run of
+// consecutive same-table DELETEs — even a run of length 1 — through the bulk
+// delete builders, which bind one Go slice per identity column. pgx registers
+// no codec for the database-specific enum *array* OID, so binding against
+// `$2::asset_kind[]` failed client-side with "unable to encode
+// []interface {}{...} into text format for unknown type". Because that is a
+// client-side error rather than a recognized pglib error type, it was treated
+// as internal and poisoned the whole batch. Identity values for enum columns
+// are now bound as text[] and cast back on the target.
+//
+// The #1035 enum fix covered only the snapshot bulk-ingest COPY path.
+func Test_PostgresToPostgres_EnumPrimaryKeyDelete(t *testing.T) {
+	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
+		t.Skip("skipping integration test...")
+	}
+
+	cfg := &stream.Config{
+		Listener:  testPostgresListenerCfg(t),
+		Processor: testPostgresProcessorCfg(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runStream(t, ctx, cfg)
+
+	enumType := "pg2pg_asset_kind"
+	domainType := "pg2pg_asset_kind_dom"
+	compositeTable := "pg2pg_asset_composite"
+	singleTable := "pg2pg_asset_single"
+	domainTable := "pg2pg_asset_domain"
+
+	// The types must exist on both sides before the tables referencing them are
+	// created. Creating them on the source can race the same DDL arriving on
+	// the target through replication, and neither CREATE TYPE nor CREATE DOMAIN
+	// supports IF NOT EXISTS, so swallow the duplicate.
+	//
+	// Both outcomes of that race have to be caught. A backend that sees the
+	// existing type during its catalog lookup raises duplicate_object, but one
+	// that loses the race to a concurrent insert gets past the lookup and fails
+	// on the pg_type_typname_nsp_index unique constraint instead, which is
+	// unique_violation.
+	ifNotExists := func(stmt string) string {
+		return fmt.Sprintf(
+			`DO $$ BEGIN %s; EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$`, stmt)
+	}
+	for _, url := range []string{pgurl, targetPGURL} {
+		execQueryWithURL(t, ctx, url, ifNotExists(
+			fmt.Sprintf(`CREATE TYPE %s AS ENUM ('BiteScan','UpperJawScan','LowerJawScan')`, enumType)))
+		execQueryWithURL(t, ctx, url, ifNotExists(fmt.Sprintf(`CREATE DOMAIN %s AS %s`, domainType, enumType)))
+	}
+	t.Cleanup(func() {
+		// cleanup runs after the test's deferred cancel(), so it needs a live
+		// context of its own.
+		cleanupCtx := context.Background()
+		for _, url := range []string{pgurl, targetPGURL} {
+			execQueryWithURL(t, cleanupCtx, url,
+				fmt.Sprintf("DROP TABLE IF EXISTS %s, %s, %s", compositeTable, singleTable, domainTable))
+			execQueryWithURL(t, cleanupCtx, url, fmt.Sprintf("DROP DOMAIN IF EXISTS %s", domainType))
+			execQueryWithURL(t, cleanupCtx, url, fmt.Sprintf("DROP TYPE IF EXISTS %s", enumType))
+		}
+	})
+
+	// composite PK containing an enum column, exactly as reported
+	execQuery(t, ctx, fmt.Sprintf(`
+		CREATE TABLE %s (
+			export_id uuid NOT NULL,
+			kind %s NOT NULL,
+			number int NOT NULL,
+			PRIMARY KEY (export_id, kind, number)
+		)`, compositeTable, enumType))
+	// single-column enum PK, which takes the ANY($1::text[]::enum[]) branch
+	execQuery(t, ctx, fmt.Sprintf(`CREATE TABLE %s (kind %s PRIMARY KEY)`, singleTable, enumType))
+	// a domain over the enum needs the column side cast too: the enum
+	// comparison operators are polymorphic over anyenum, which does not accept
+	// a domain. Deletes on this shape failed on every path before, including
+	// the per-row form, with "operator does not exist: dom = dom".
+	execQuery(t, ctx, fmt.Sprintf(`CREATE TABLE %s (kind %s PRIMARY KEY)`, domainTable, domainType))
+
+	targetConn, err := pglib.NewConn(ctx, targetPGURL)
+	require.NoError(t, err)
+	defer targetConn.Close(ctx)
+
+	waitForCount := func(t *testing.T, table string, want int) {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			var count int
+			if err := targetConn.QueryRow(ctx, []any{&count}, fmt.Sprintf("SELECT count(*) FROM %s", table)); err != nil {
+				// the table may not have been replicated yet
+				return false
+			}
+			return count == want
+		}, 20*time.Second, 200*time.Millisecond,
+			"table %s: want %d rows on target", table, want)
+	}
+
+	execQuery(t, ctx, fmt.Sprintf(
+		`INSERT INTO %s VALUES ('550e8400-e29b-41d4-a716-446655440000','BiteScan',1),
+		                       ('550e8400-e29b-41d4-a716-446655440001','UpperJawScan',2)`, compositeTable))
+	execQuery(t, ctx, fmt.Sprintf(`INSERT INTO %s VALUES ('BiteScan'),('UpperJawScan')`, singleTable))
+	execQuery(t, ctx, fmt.Sprintf(`INSERT INTO %s VALUES ('BiteScan'),('UpperJawScan')`, domainTable))
+
+	waitForCount(t, compositeTable, 2)
+	waitForCount(t, singleTable, 2)
+	waitForCount(t, domainTable, 2)
+
+	t.Run("delete on composite enum PK", func(t *testing.T) {
+		execQuery(t, ctx, fmt.Sprintf("DELETE FROM %s WHERE kind = 'BiteScan'", compositeTable))
+		waitForCount(t, compositeTable, 1)
+
+		var kind string
+		err := targetConn.QueryRow(ctx, []any{&kind}, fmt.Sprintf("SELECT kind::text FROM %s", compositeTable))
+		require.NoError(t, err)
+		require.Equal(t, "UpperJawScan", kind, "the wrong row was deleted")
+	})
+
+	t.Run("delete on single-column enum PK", func(t *testing.T) {
+		execQuery(t, ctx, fmt.Sprintf("DELETE FROM %s WHERE kind = 'BiteScan'", singleTable))
+		waitForCount(t, singleTable, 1)
+
+		var kind string
+		err := targetConn.QueryRow(ctx, []any{&kind}, fmt.Sprintf("SELECT kind::text FROM %s", singleTable))
+		require.NoError(t, err)
+		require.Equal(t, "UpperJawScan", kind, "the wrong row was deleted")
+	})
+
+	t.Run("delete on domain-over-enum PK", func(t *testing.T) {
+		// the source statement needs ::text too — postgres has no
+		// `domain = unknown` operator either, which is how exotic this shape is
+		execQuery(t, ctx, fmt.Sprintf("DELETE FROM %s WHERE kind::text = 'BiteScan'", domainTable))
+		waitForCount(t, domainTable, 1)
+
+		var kind string
+		err := targetConn.QueryRow(ctx, []any{&kind}, fmt.Sprintf("SELECT kind::text FROM %s", domainTable))
+		require.NoError(t, err)
+		require.Equal(t, "UpperJawScan", kind, "the wrong row was deleted")
+	})
+
+	t.Run("delete remaining rows", func(t *testing.T) {
+		execQuery(t, ctx, fmt.Sprintf("DELETE FROM %s", compositeTable))
+		execQuery(t, ctx, fmt.Sprintf("DELETE FROM %s", singleTable))
+		execQuery(t, ctx, fmt.Sprintf("DELETE FROM %s", domainTable))
+		waitForCount(t, compositeTable, 0)
+		waitForCount(t, singleTable, 0)
+		waitForCount(t, domainTable, 0)
+	})
 }

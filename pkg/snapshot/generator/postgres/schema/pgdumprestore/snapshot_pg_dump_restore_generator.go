@@ -10,17 +10,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	pglib "github.com/xataio/pgstream/internal/postgres"
 	pglibinstrumentation "github.com/xataio/pgstream/internal/postgres/instrumentation"
+	"github.com/xataio/pgstream/pkg/backoff"
 	loglib "github.com/xataio/pgstream/pkg/log"
 	"github.com/xataio/pgstream/pkg/otel"
 	"github.com/xataio/pgstream/pkg/snapshot"
 	"github.com/xataio/pgstream/pkg/snapshot/generator"
 	"github.com/xataio/pgstream/pkg/wal/processor"
+	"golang.org/x/sync/errgroup"
 )
 
 // SnapshotGenerator generates postgres schema snapshots using pg_dump and
@@ -39,7 +43,56 @@ type SnapshotGenerator struct {
 	roleSQLParser          *roleSQLParser
 	optionGenerator        *optionGenerator
 	snapshotTracker        snapshotProgressTracker
+	// restoreConflictTargetsBeforeData restores constraints/indexes that can
+	// be used as INSERT ... ON CONFLICT targets before the wrapped data snapshot
+	// generator runs. Other indexes and constraints, such as foreign keys, are
+	// still restored after data is inserted.
+	restoreConflictTargetsBeforeData bool
+	// refreshMaterializedViews controls whether materialized views are refreshed
+	// (REFRESH MATERIALIZED VIEW ... WITH DATA) after the table data has been
+	// restored. Disabled by default since refreshing can be expensive on large
+	// views.
+	refreshMaterializedViews bool
+	// indexConstraintSessionSettings are applied through PGOPTIONS only to
+	// index and constraint restore sessions. They are cleared when restoring to
+	// WAL (see WithRestoreToWAL), since that path converts the dump into WAL
+	// events instead of running a psql/pg_restore session.
+	indexConstraintSessionSettings []string
+	objectTypeFilter               *objectTypeFilter
+	// indexRestoreBackoff provides the retry policy for index and constraint
+	// restores that fail with transient errors, such as a connection dropped by
+	// an intermittent network fault. Rerunning the dump is safe because objects
+	// created by an earlier attempt fail with "already exists", which the
+	// restore ignores.
+	indexRestoreBackoff backoff.Provider
+	// indexRestoreWorkers controls how many standalone CREATE INDEX/CREATE
+	// UNIQUE INDEX statements are restored concurrently. Defaults to 1
+	// (sequential, unchanged behaviour).
+	indexRestoreWorkers uint
+	// ignoredMu guards the two fields below. The index and constraint pass
+	// restores blocks concurrently, so more than one goroutine reaches
+	// restoreDumpWithOptions at a time.
+	ignoredMu sync.Mutex
+	// ignoredByPhase collects, for one CreateSnapshot, every error a restore
+	// pass chose to ignore, keyed by the pass that produced it.
+	ignoredByPhase map[string][]error
+	// ignoredPhases keeps those keys in the order the passes ran, so the
+	// summary reads in the order the operator saw them happen.
+	ignoredPhases []string
 }
+
+// Restore passes, named for the summary that reports what each of them chose
+// to ignore.
+const (
+	phaseSchemas                 = "schemas"
+	phaseCleanup                 = "cleanup"
+	phaseRoles                   = "roles"
+	phaseSchema                  = "schema"
+	phaseSequenceData            = "sequence data"
+	phaseIndicesAndConstraints   = "indices and constraints"
+	phaseViews                   = "views"
+	phaseMaterializedViewRefresh = "materialized view refreshes"
+)
 
 type snapshotProgressTracker interface {
 	trackIndexesCreation(ctx context.Context)
@@ -67,6 +120,92 @@ type Config struct {
 	DumpDebugFile string
 	// if set, security label providers that will be excluded from the dump
 	ExcludedSecurityLabels []string
+	// if set to true, materialized views will be refreshed (REFRESH MATERIALIZED
+	// VIEW ... WITH DATA) after the table data has been restored. Disabled by
+	// default since refreshing can be expensive on large views.
+	RefreshMaterializedViews bool
+	// Session settings in name=value format applied only while restoring indexes
+	// and constraints. An empty list preserves the existing behavior.
+	IndexConstraintSessionSettings []string
+	// IndexRestoreRetries is the retry policy applied when restoring indexes
+	// and constraints fails with a transient error. If not set, it defaults to
+	// exponential backoff with an initial interval of 1s, a max interval of
+	// 1min and 3 retries.
+	IndexRestoreRetries backoff.Config
+	// IndexRestoreWorkers is the number of standalone CREATE INDEX/CREATE
+	// UNIQUE INDEX statements restored concurrently against the target
+	// database. Statements that depend on an index existing (constraints
+	// added USING INDEX, comments, partition attachments, REPLICA IDENTITY
+	// and CLUSTER) are always restored afterwards, once every index has been
+	// created. Defaults to 1, which preserves the existing sequential
+	// behaviour. Each worker holds a target connection and applies
+	// IndexConstraintSessionSettings to it, so both the connections and the
+	// memory those settings reserve scale with this value. Capped at
+	// maxIndexRestoreWorkers.
+	IndexRestoreWorkers uint
+	// IncludeObjectTypes is a list of object type categories to include in the
+	// schema snapshot. Only one of IncludeObjectTypes or ExcludeObjectTypes
+	// can be set.
+	IncludeObjectTypes []string
+	// ExcludeObjectTypes is a list of object type categories to exclude from
+	// the schema snapshot. Only one of IncludeObjectTypes or
+	// ExcludeObjectTypes can be set.
+	ExcludeObjectTypes []string
+}
+
+// sessionSettingRegex validates a single index/constraint session setting of
+// the form name=value. The name must be a valid PostgreSQL configuration
+// parameter identifier, and neither the name nor the value may contain
+// whitespace: the settings are passed to the restore subprocess through
+// PGOPTIONS, which libpq splits on whitespace, so allowing whitespace would let
+// a single setting inject additional backend command-line options.
+var sessionSettingRegex = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*=\S+$`)
+
+var errInvalidSessionSetting = errors.New("invalid index constraint session setting, must be a whitespace-free name=value pair")
+
+const (
+	defaultIndexRestoreRetryInitialInterval = time.Second
+	defaultIndexRestoreRetryMaxInterval     = time.Minute
+	defaultIndexRestoreMaxRetries           = 3
+	defaultIndexRestoreWorkers              = 1
+	// maxIndexRestoreWorkers keeps IndexRestoreWorkers from exhausting the
+	// target's connection slots or memory, and catches a negative value that
+	// wrapped around into a huge uint in the config decoder.
+	maxIndexRestoreWorkers = 32
+)
+
+var errTooManyIndexRestoreWorkers = errors.New("index restore workers above the maximum")
+
+func (c *Config) indexRestoreWorkers() uint {
+	if c.IndexRestoreWorkers > 0 {
+		return c.IndexRestoreWorkers
+	}
+	return defaultIndexRestoreWorkers
+}
+
+func (c *Config) indexRestoreBackoffConfig() *backoff.Config {
+	if c.IndexRestoreRetries.DisableRetries {
+		return &backoff.Config{}
+	}
+	if c.IndexRestoreRetries.IsSet() {
+		return &c.IndexRestoreRetries
+	}
+	return &backoff.Config{
+		Exponential: &backoff.ExponentialConfig{
+			InitialInterval: defaultIndexRestoreRetryInitialInterval,
+			MaxInterval:     defaultIndexRestoreRetryMaxInterval,
+			MaxRetries:      defaultIndexRestoreMaxRetries,
+		},
+	}
+}
+
+func validateSessionSettings(settings []string) error {
+	for _, setting := range settings {
+		if !sessionSettingRegex.MatchString(setting) {
+			return fmt.Errorf("%w: %q", errInvalidSessionSetting, setting)
+		}
+	}
+	return nil
 }
 
 type Option func(s *SnapshotGenerator)
@@ -76,10 +215,19 @@ type dump struct {
 	filtered              []byte
 	cleanupPart           []byte
 	indicesAndConstraints []byte
-	views                 []byte
-	sequences             []string
-	roles                 map[string]role
-	eventTriggers         []byte
+	// views holds the statements that are validated against the catalog at
+	// creation time and can rely on indices and constraints existing (views,
+	// materialized views, _RETURN rules and functions with SQL-standard
+	// bodies), so they are restored after the indices and constraints.
+	views                     []byte
+	materializedViewRefreshes []byte
+	sequences                 []string
+	// identitySequences are the sequences of identity columns. pg_dump writes
+	// them inside the ALTER TABLE that adds the identity, not with CREATE
+	// SEQUENCE, and dumps their data only together with the table data.
+	identitySequences []string
+	roles             map[string]role
+	eventTriggers     []byte
 }
 
 const (
@@ -90,23 +238,41 @@ const (
 // NewSnapshotGenerator will return a postgres schema snapshot generator that
 // uses pg_dump and pg_restore to sync the schema of two postgres databases
 func NewSnapshotGenerator(ctx context.Context, c *Config, opts ...Option) (*SnapshotGenerator, error) {
+	if err := validateSessionSettings(c.IndexConstraintSessionSettings); err != nil {
+		return nil, err
+	}
+
+	if workers := c.indexRestoreWorkers(); workers > maxIndexRestoreWorkers {
+		return nil, fmt.Errorf("%w: %d configured, maximum is %d", errTooManyIndexRestoreWorkers, workers, maxIndexRestoreWorkers)
+	}
+
 	sourceConnPool, err := pglib.NewConnPool(ctx, c.SourcePGURL)
 	if err != nil {
 		return nil, err
 	}
 
+	objTypeFilter, err := newObjectTypeFilter(c.IncludeObjectTypes, c.ExcludeObjectTypes)
+	if err != nil {
+		return nil, fmt.Errorf("invalid object type filter config: %w", err)
+	}
+
 	sg := &SnapshotGenerator{
-		sourceURL:              c.SourcePGURL,
-		targetURL:              c.TargetPGURL,
-		pgDumpFn:               pglib.RunPGDump,
-		pgDumpAllFn:            pglib.RunPGDumpAll,
-		pgRestoreFn:            pglib.RunPGRestore,
-		logger:                 loglib.NewNoopLogger(),
-		dumpDebugFile:          c.DumpDebugFile,
-		excludedSecurityLabels: c.ExcludedSecurityLabels,
-		roleSQLParser:          &roleSQLParser{},
-		sourceQuerier:          sourceConnPool,
-		optionGenerator:        newOptionGenerator(sourceConnPool, c),
+		sourceURL:                      c.SourcePGURL,
+		targetURL:                      c.TargetPGURL,
+		pgDumpFn:                       pglib.RunPGDump,
+		pgDumpAllFn:                    pglib.RunPGDumpAll,
+		pgRestoreFn:                    pglib.RunPGRestore,
+		logger:                         loglib.NewNoopLogger(),
+		dumpDebugFile:                  c.DumpDebugFile,
+		excludedSecurityLabels:         c.ExcludedSecurityLabels,
+		roleSQLParser:                  &roleSQLParser{},
+		sourceQuerier:                  sourceConnPool,
+		optionGenerator:                newOptionGenerator(sourceConnPool, c),
+		refreshMaterializedViews:       c.RefreshMaterializedViews,
+		indexConstraintSessionSettings: c.IndexConstraintSessionSettings,
+		objectTypeFilter:               objTypeFilter,
+		indexRestoreBackoff:            backoff.NewProvider(c.indexRestoreBackoffConfig()),
+		indexRestoreWorkers:            c.indexRestoreWorkers(),
 	}
 
 	for _, opt := range opts {
@@ -159,18 +325,57 @@ func WithProgressTracking(ctx context.Context) Option {
 func WithRestoreToWAL(processor processor.Processor) Option {
 	return func(sg *SnapshotGenerator) {
 		sg.pgRestoreFn = newPGSnapshotWALRestore(processor, sg.sourceQuerier).restoreToWAL
+		sg.indexConstraintSessionSettings = nil
+		// this path converts the dump into WAL events for a non-postgres
+		// target instead of running index builds against a target database,
+		// so concurrency buys nothing and would emit the DDL events out of
+		// order
+		sg.indexRestoreWorkers = defaultIndexRestoreWorkers
+	}
+}
+
+// WithRestoreConflictTargetsBeforeData restores constraints and indexes that
+// can be used as INSERT ... ON CONFLICT targets (primary keys, unique
+// constraints and unique indexes) before the wrapped data snapshot generator
+// runs. This is required when the data writer emits
+// INSERT ... ON CONFLICT DO UPDATE, since the target table must already have a
+// matching unique or primary key constraint at insert time.
+func WithRestoreConflictTargetsBeforeData() Option {
+	return func(sg *SnapshotGenerator) {
+		sg.restoreConflictTargetsBeforeData = true
 	}
 }
 
 func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Snapshot) (err error) {
-	s.logger.Info("creating schema snapshot", loglib.Fields{"schemaTables": ss.SchemaTables})
+	s.logger.Info("creating schema snapshot", loglib.Fields{"schemaTables": ss.SchemaTables, "schemaOnlyTables": ss.SchemaOnlyTables})
+
+	s.resetIgnored()
+	defer s.summariseIgnored()
 
 	// make sure any empty schemas are filtered out
-	dumpSchemas := make(map[string][]string, len(ss.SchemaTables))
+	dataSchemas := make(map[string][]string, len(ss.SchemaTables))
 	for schema, tables := range ss.SchemaTables {
 		if len(tables) > 0 {
-			dumpSchemas[schema] = tables
+			dataSchemas[schema] = tables
 		}
+	}
+	schemaOnly := make(map[string][]string, len(ss.SchemaOnlyTables))
+	for schema, tables := range ss.SchemaOnlyTables {
+		if len(tables) > 0 {
+			schemaOnly[schema] = tables
+		}
+	}
+	if err := pglib.ValidateWildcardSchemaTables(schemaOnly); err != nil {
+		return err
+	}
+	// the schema snapshot scope is the union of the data snapshot tables and
+	// the schema-only tables
+	dumpSchemas := make(map[string][]string, len(dataSchemas)+len(schemaOnly))
+	for schema, tables := range dataSchemas {
+		dumpSchemas[schema] = tables
+	}
+	for schema, tables := range schemaOnly {
+		dumpSchemas[schema] = mergeTables(dumpSchemas[schema], tables)
 	}
 	// nothing to dump
 	if len(dumpSchemas) == 0 {
@@ -179,18 +384,33 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 
 	// DUMP
 
-	dump, err := s.dumpSchema(ctx, dumpSchemas, ss.SchemaExcludedTables)
+	// pin before the dump
+	if err := s.captureTableColumns(ctx, ss, dumpSchemas); err != nil {
+		return err
+	}
+
+	dump, err := s.dumpSchema(ctx, dataSchemas, schemaOnly, ss.SchemaExcludedTables)
 	if err != nil {
 		return err
 	}
+
+	s.warnOnCaptureDrift(ctx, ss, dumpSchemas)
 
 	// the schema will include the sequences but will not produce the `SETVAL`
 	// queries since that's considered data and it's a schema only dump. Produce
 	// the data only dump for the sequences only and restore it along with the
 	// schema.
-	sequenceDump, err := s.dumpSequenceValues(ctx, dump.sequences)
-	if err != nil {
-		return err
+	var sequenceDump []byte
+	if !s.objectTypeFilter.isCategoryExcluded("sequences") {
+		sequenceDump, err = s.dumpSequenceValues(ctx, dump.sequences)
+		if err != nil {
+			return err
+		}
+		identitySequenceDump, err := s.dumpIdentitySequenceValues(ctx, dump.identitySequences)
+		if err != nil {
+			return err
+		}
+		sequenceDump = append(sequenceDump, identitySequenceDump...)
 	}
 
 	// the schema dump will not include the roles, so we need to dump them
@@ -208,25 +428,36 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 
 	if s.optionGenerator.cleanTargetDB {
 		s.logger.Info("restoring cleanup")
-		if err := s.restoreDump(ctx, dump.cleanupPart); err != nil {
+		if err := s.restoreDump(ctx, phaseCleanup, dump.cleanupPart); err != nil {
 			return err
 		}
 	}
 
 	if rolesDump != nil {
 		s.logger.Info("restoring roles")
-		if err := s.restoreDump(ctx, rolesDump); err != nil {
+		if err := s.restoreDump(ctx, phaseRoles, rolesDump); err != nil {
 			return err
 		}
 	}
 
 	s.logger.Info("restoring schema")
-	if err := s.restoreDump(ctx, dump.filtered); err != nil {
+	if err := s.restoreDump(ctx, phaseSchema, dump.filtered); err != nil {
 		return err
 	}
 
+	indicesAndConstraintsDump := dump.indicesAndConstraints
+	if s.generator != nil && s.restoreConflictTargetsBeforeData {
+		conflictTargets, remaining := splitConflictTargetConstraints(dump.indicesAndConstraints)
+		if err := s.restoreIndicesAndConstraints(ctx, conflictTargets, ss); err != nil {
+			return err
+		}
+		indicesAndConstraintsDump = remaining
+	}
+
 	// call the wrapped snapshot generator if any before restoring sequences,
-	// indices and constraints to improve performance.
+	// indices and constraints to improve performance. When the data snapshot
+	// writer emits INSERT ... ON CONFLICT DO UPDATE, the subset of constraints
+	// needed as conflict targets is restored before data above.
 	if s.generator != nil {
 		if err := s.generator.CreateSnapshot(ctx, ss); err != nil {
 			return err
@@ -234,22 +465,254 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 	}
 
 	// apply the sequences, indices and constraints when the wrapped generator has finished
-	s.logger.Info("restoring sequence data", loglib.Fields{"schemaTables": ss.SchemaTables})
-	if err := s.restoreDump(ctx, sequenceDump); err != nil {
-		return err
-	}
-
-	s.logger.Info("restoring schema indices and constraints", loglib.Fields{"schemaTables": ss.SchemaTables})
-	if s.snapshotTracker != nil {
-		if err := s.restoreIndicesWithTracking(ctx, dump.indicesAndConstraints); err != nil {
+	if !s.objectTypeFilter.isCategoryExcluded("sequences") {
+		s.logger.Info("restoring sequence data", loglib.Fields{"schemaTables": ss.SchemaTables})
+		if err := s.restoreDump(ctx, phaseSequenceData, sequenceDump); err != nil {
 			return err
 		}
-	} else if err := s.restoreDump(ctx, dump.indicesAndConstraints); err != nil {
-		return err
+	}
+
+	if len(indicesAndConstraintsDump) > 0 {
+		if err := s.restoreIndicesAndConstraints(ctx, indicesAndConstraintsDump, ss); err != nil {
+			return err
+		}
 	}
 
 	s.logger.Info("restoring views")
-	return s.restoreDump(ctx, dump.views)
+	if err := s.restoreDump(ctx, phaseViews, dump.views); err != nil {
+		return err
+	}
+
+	if !s.refreshMaterializedViews {
+		return nil
+	}
+
+	s.logger.Info("refreshing materialized views")
+	return s.restoreDump(ctx, phaseMaterializedViewRefresh, dump.materializedViewRefreshes)
+}
+
+func splitConflictTargetConstraints(d []byte) ([]byte, []byte) {
+	blocks := strings.Split(string(d), "\n\n")
+	connectBlocks := []string{}
+	conflictTargetBlocks := []string{}
+	remainingBlocks := []string{}
+
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		switch {
+		case strings.Contains(block, `\connect`):
+			connectBlocks = append(connectBlocks, block)
+		case isConflictTargetConstraint(block):
+			conflictTargetBlocks = append(conflictTargetBlocks, block)
+		default:
+			remainingBlocks = append(remainingBlocks, block)
+		}
+	}
+
+	return joinDumpBlocks(connectBlocks, conflictTargetBlocks), joinDumpBlocks(connectBlocks, remainingBlocks)
+}
+
+func joinDumpBlocks(connectBlocks, blocks []string) []byte {
+	if len(blocks) == 0 {
+		return nil
+	}
+	allBlocks := make([]string, 0, len(connectBlocks)+len(blocks))
+	allBlocks = append(allBlocks, connectBlocks...)
+	allBlocks = append(allBlocks, blocks...)
+	return []byte(strings.Join(allBlocks, "\n\n") + "\n\n")
+}
+
+func isConflictTargetConstraint(block string) bool {
+	upperBlock := strings.ToUpper(block)
+	if strings.HasPrefix(upperBlock, "CREATE UNIQUE INDEX") {
+		return true
+	}
+	if !strings.Contains(upperBlock, "ADD CONSTRAINT") {
+		return false
+	}
+	return strings.Contains(upperBlock, " PRIMARY KEY (") ||
+		strings.Contains(upperBlock, " PRIMARY KEY USING INDEX ") ||
+		strings.Contains(upperBlock, " UNIQUE (") ||
+		strings.Contains(upperBlock, " UNIQUE NULLS NOT DISTINCT (") ||
+		strings.Contains(upperBlock, " UNIQUE USING INDEX ")
+}
+
+func (s *SnapshotGenerator) restoreIndicesAndConstraints(ctx context.Context, dump []byte, ss *snapshot.Snapshot) error {
+	s.logger.Info("restoring schema indices and constraints", loglib.Fields{"schemaTables": ss.SchemaTables})
+	opts := s.optionGenerator.pgrestoreOptions()
+	opts.SessionSettings = s.indexConstraintSessionSettings
+
+	retries := 0
+	var restoreErr error
+	bo := s.indexRestoreBackoffProvider()(ctx)
+	err := bo.RetryNotify(
+		func() error {
+			restoreErr = s.restoreIndices(ctx, opts, dump)
+			return asRetryError(restoreErr)
+		},
+		func(err error, d time.Duration) {
+			retries++
+			s.logger.Warn(err, "restoring schema indices and constraints failed with a transient error, retrying", loglib.Fields{
+				"retries": retries,
+				"backoff": d,
+			})
+		},
+	)
+	if err == nil {
+		return nil
+	}
+	// the backoff wraps the failure in its own retry bookkeeping, so report the
+	// restore failure itself, unless the retries were cut short by the context
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if restoreErr != nil {
+		return restoreErr
+	}
+	return err
+}
+
+// indexRestoreBackoffProvider falls back to a provider that does not retry, so
+// that a generator built without going through NewSnapshotGenerator keeps the
+// single-attempt behaviour instead of panicking on a nil provider.
+func (s *SnapshotGenerator) indexRestoreBackoffProvider() backoff.Provider {
+	if s.indexRestoreBackoff != nil {
+		return s.indexRestoreBackoff
+	}
+	return func(context.Context) backoff.Backoff { return backoff.NewStopBackoff() }
+}
+
+func (s *SnapshotGenerator) restoreIndices(ctx context.Context, opts pglib.PGRestoreOptions, dump []byte) error {
+	if s.snapshotTracker != nil {
+		return s.restoreIndicesWithTracking(ctx, opts, dump)
+	}
+	return s.restoreIndexDump(ctx, opts, dump)
+}
+
+// restoreIndexDump restores standalone CREATE INDEX/CREATE UNIQUE INDEX
+// statements concurrently across up to indexRestoreWorkers connections, since
+// they have no dependencies on each other. Every other statement in dump may
+// depend on an index existing (a constraint added USING INDEX, a comment on
+// the index, a partition attachment, REPLICA IDENTITY or CLUSTER), so it is
+// only restored once all indexes above have been created, preserving its
+// original relative order.
+func (s *SnapshotGenerator) restoreIndexDump(ctx context.Context, opts pglib.PGRestoreOptions, dump []byte) error {
+	if s.indexRestoreWorkers <= 1 {
+		return s.restoreDumpWithOptions(ctx, phaseIndicesAndConstraints, opts, dump)
+	}
+
+	connectBlocks, indexBlocks, otherBlocks := partitionDumpBlocks(dump, isIndexStatement)
+	if len(indexBlocks) <= 1 {
+		s.logger.Debug("restoring indices sequentially, too few index statements to parallelise",
+			loglib.Fields{"index_statements": len(indexBlocks)})
+		return s.restoreDumpWithOptions(ctx, phaseIndicesAndConstraints, opts, dump)
+	}
+
+	s.logger.Info("restoring indices concurrently", loglib.Fields{
+		"index_restore_workers": s.indexRestoreWorkers,
+		"index_statements":      len(indexBlocks),
+		"dependent_statements":  len(otherBlocks),
+	})
+	indexErr := s.restoreIndexBlocksInParallel(ctx, opts, connectBlocks, indexBlocks)
+
+	// the dependent statements are restored even when an index failed. The
+	// single restore this replaces applied all of them and reported the
+	// failure, and the ones whose index is missing fail with "does not
+	// exist", which the restore already ignores. Skipping them would leave
+	// the target with data but without its constraints, foreign keys and
+	// replica identities, and nothing short of a re-snapshot to repair it.
+	if ctx.Err() != nil {
+		return errors.Join(indexErr, ctx.Err())
+	}
+
+	otherErr := s.restoreDumpWithOptions(ctx, phaseIndicesAndConstraints, opts, joinDumpBlocks(connectBlocks, otherBlocks))
+	return pglib.MergePGRestoreErrors(indexErr, otherErr)
+}
+
+// restoreIndexBlocksInParallel restores each of indexBlocks on its own restore
+// call, prefixed with any connect statements, running up to
+// indexRestoreWorkers of them at a time.
+//
+// A failing index deliberately does not cancel the restores still in flight.
+// Cancelling kills psql mid-CREATE INDEX, which the server only notices once
+// the statement completes, so the index it was building is committed anyway
+// and collides with the retry that restoreIndicesAndConstraints issues moments
+// later: the reissued statement waits on the orphan's uncommitted catalog row
+// and then fails with a duplicate key error that is classified as permanent,
+// turning a transient failure into a lost snapshot. Every block is attempted
+// instead, and the failures are merged so the retry decision is taken over the
+// whole wave rather than over whichever error happened to arrive first.
+func (s *SnapshotGenerator) restoreIndexBlocksInParallel(ctx context.Context, opts pglib.PGRestoreOptions, connectBlocks, indexBlocks []string) error {
+	eg := errgroup.Group{}
+	// the conversion is safe: the worker count is capped at
+	// maxIndexRestoreWorkers when the generator is built
+	eg.SetLimit(int(s.indexRestoreWorkers))
+
+	mutex := sync.Mutex{}
+	restoreErrs := make([]error, 0, len(indexBlocks))
+
+	for _, block := range indexBlocks {
+		if ctx.Err() != nil {
+			break
+		}
+		eg.Go(func() error {
+			err := s.restoreDumpWithOptions(ctx, phaseIndicesAndConstraints, opts, joinDumpBlocks(connectBlocks, []string{block}))
+			if err != nil {
+				s.logger.Warn(err, "restoring index", loglib.Fields{"statement": block})
+				mutex.Lock()
+				restoreErrs = append(restoreErrs, err)
+				mutex.Unlock()
+			}
+			// the failure is collected rather than returned, so that the
+			// group keeps the remaining indices going
+			return nil
+		})
+	}
+	_ = eg.Wait()
+
+	return pglib.MergePGRestoreErrors(restoreErrs...)
+}
+
+// partitionDumpBlocks splits a dump into the blank line separated statement
+// blocks pg_dump emits, and sorts them into the connect statements, the blocks
+// matching the predicate, and the rest, preserving the relative order of the
+// last two groups.
+//
+// The connect statements are kept apart because they select the database the
+// statements after them apply to, so every subset of the blocks has to be
+// prefixed with them (see joinDumpBlocks).
+func partitionDumpBlocks(dump []byte, matches func(block string) bool) (connectBlocks, matchingBlocks, otherBlocks []string) {
+	for _, block := range strings.Split(string(dump), "\n\n") {
+		block = strings.TrimSpace(block)
+		switch {
+		case block == "":
+			continue
+		case strings.Contains(block, `\connect`):
+			connectBlocks = append(connectBlocks, block)
+		case matches(block):
+			matchingBlocks = append(matchingBlocks, block)
+		default:
+			otherBlocks = append(otherBlocks, block)
+		}
+	}
+	return connectBlocks, matchingBlocks, otherBlocks
+}
+
+// asRetryError marks any error that rerunning the dump cannot resolve as
+// permanent, so that the backoff gives up immediately instead of repeating a
+// restore that is guaranteed to fail the same way.
+func asRetryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	pgrestoreErr := &pglib.PGRestoreErrors{}
+	if errors.As(err, &pgrestoreErr) && pgrestoreErr.IsRetryable() {
+		return err
+	}
+	return fmt.Errorf("%w: %w", err, backoff.ErrPermanent)
 }
 
 func (s *SnapshotGenerator) Close() error {
@@ -274,8 +737,80 @@ func (s *SnapshotGenerator) Close() error {
 	return nil
 }
 
-func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables map[string][]string, excludedTables map[string][]string) (*dump, error) {
-	pgdumpOpts, err := s.optionGenerator.pgdumpOptions(ctx, schemaTables, excludedTables)
+// captureTableColumns precedes the dump.
+func (s *SnapshotGenerator) captureTableColumns(ctx context.Context, ss *snapshot.Snapshot, dumpSchemas map[string][]string) error {
+	if s.generator == nil {
+		// schema-only snapshot, nothing to pin
+		return nil
+	}
+
+	captureSchemas, captureTables := captureScope(dumpSchemas)
+	tableColumns, err := pglib.DiscoverTableColumns(ctx, s.sourceQuerier, captureSchemas, captureTables)
+	if err != nil {
+		return fmt.Errorf("capturing source table columns: %w", err)
+	}
+
+	ss.TableColumns = tableColumns
+	return nil
+}
+
+// captureScope narrows to dump scope.
+func captureScope(dumpSchemas map[string][]string) (schemas, tables []string) {
+	if !hasWildcardSchema(dumpSchemas) {
+		schemas = make([]string, 0, len(dumpSchemas))
+		for schema := range dumpSchemas {
+			schemas = append(schemas, schema)
+		}
+	}
+
+	for _, schemaTables := range dumpSchemas {
+		if hasWildcardTable(schemaTables) {
+			return schemas, nil
+		}
+		tables = append(tables, schemaTables...)
+	}
+	return schemas, tables
+}
+
+// warnOnCaptureDrift exposes the window.
+func (s *SnapshotGenerator) warnOnCaptureDrift(ctx context.Context, ss *snapshot.Snapshot, dumpSchemas map[string][]string) {
+	if ss.TableColumns == nil {
+		return
+	}
+
+	captureSchemas, captureTables := captureScope(dumpSchemas)
+	current, err := pglib.DiscoverTableColumns(ctx, s.sourceQuerier, captureSchemas, captureTables)
+	if err != nil {
+		s.logger.Warn(err, "checking for source schema drift during the schema dump")
+		return
+	}
+
+	drifted := []string{}
+	for schema, tables := range ss.TableColumns {
+		for table, columns := range tables {
+			if !slices.Equal(columns, current[schema][table]) {
+				drifted = append(drifted, schema+"."+table)
+			}
+		}
+	}
+	for schema, tables := range current {
+		for table := range tables {
+			if _, found := ss.TableColumns[schema][table]; !found {
+				drifted = append(drifted, schema+"."+table)
+			}
+		}
+	}
+	if len(drifted) == 0 {
+		return
+	}
+
+	slices.Sort(drifted)
+	s.logger.Warn(nil, "source schema changed while the schema was being dumped; these tables may be snapshotted with stale columns and need replication to converge, or a re-snapshot if none follows",
+		loglib.Fields{"tables": drifted})
+}
+
+func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables, schemaOnlyTables, excludedTables map[string][]string) (*dump, error) {
+	pgdumpOpts, err := s.optionGenerator.pgdumpOptions(ctx, schemaTables, schemaOnlyTables, excludedTables)
 	if err != nil {
 		return nil, fmt.Errorf("preparing pg_dump options: %w", err)
 	}
@@ -310,7 +845,7 @@ func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables map[str
 			s.logger.Error(err, "pg_dump for schema failed", loglib.Fields{"pgdumpOptions": pgdumpOpts.ToArgs()})
 			return nil, fmt.Errorf("dumping schema: %w", err)
 		}
-		parsedDump.cleanupPart = getDumpsDiff(dumpWithCleanUp, d)
+		parsedDump.cleanupPart = s.objectTypeFilter.filterCleanupDump(getDumpsDiff(dumpWithCleanUp, d))
 		s.dumpToFile(s.getDumpFileName("-cleanup"), pgdumpOpts, parsedDump.cleanupPart)
 	}
 
@@ -331,6 +866,94 @@ func (s *SnapshotGenerator) dumpSequenceValues(ctx context.Context, sequences []
 		return nil, fmt.Errorf("dumping sequence values: %w", err)
 	}
 	return d, nil
+}
+
+// identitySequenceValuesBatchSize is the number of sequences read in one
+// query. Each sequence takes a lock and a query parameter.
+const identitySequenceValuesBatchSize = 500
+
+// identitySequenceValuesQuery returns the query that produces one setval
+// statement per sequence on input, in the same form as the pg_dump sequence
+// data. The sequence names must be quoted identifiers.
+//
+// The query reads last_value and is_called from each sequence, as pg_dump
+// does. pg_sequence_last_value returns NULL for a sequence with is_called
+// false, which hides a sequence that was restarted and not used since.
+func identitySequenceValuesQuery(sequences []string) string {
+	selects := make([]string, 0, len(sequences))
+	for i, sequence := range sequences {
+		// ::text renders true/false; %s on a boolean renders t/f, which setval rejects as a column name
+		selects = append(selects, fmt.Sprintf(
+			"SELECT format('SELECT pg_catalog.setval(%%L, %%s, %%s);', $%d::text, last_value, is_called::text) FROM %s",
+			i+1, sequence,
+		))
+	}
+	return strings.Join(selects, "\nUNION ALL\n")
+}
+
+// dumpIdentitySequenceValues reads the current values of the identity
+// sequences on the source. pg_dump dumps the data of an identity sequence only
+// together with the data of its table, so the data-only dump of the sequences
+// does not include them.
+func (s *SnapshotGenerator) dumpIdentitySequenceValues(ctx context.Context, sequences []string) ([]byte, error) {
+	if len(sequences) == 0 {
+		return nil, nil
+	}
+
+	s.logger.Debug("dumping identity sequence data", loglib.Fields{"sequences": sequences})
+	var d bytes.Buffer
+	for batch := range slices.Chunk(sequences, identitySequenceValuesBatchSize) {
+		if err := s.writeIdentitySequenceValues(ctx, &d, batch); err != nil {
+			return nil, err
+		}
+	}
+	return d.Bytes(), nil
+}
+
+func (s *SnapshotGenerator) writeIdentitySequenceValues(ctx context.Context, d *bytes.Buffer, sequences []string) error {
+	args := make([]any, 0, len(sequences))
+	for _, sequence := range sequences {
+		args = append(args, sequence)
+	}
+
+	rows, err := s.sourceQuerier.Query(ctx, identitySequenceValuesQuery(sequences), args...)
+	if err != nil {
+		return fmt.Errorf("querying identity sequence values: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var statement string
+		if err := rows.Scan(&statement); err != nil {
+			return fmt.Errorf("scanning identity sequence value: %w", err)
+		}
+		d.WriteString(statement)
+		d.WriteString("\n")
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reading identity sequence values: %w", err)
+	}
+	return nil
+}
+
+// identitySequenceName returns the sequence name when line is the second line
+// of an identity column definition, which pg_dump splits over several lines:
+//
+//	ALTER TABLE public.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+//	    SEQUENCE NAME public.t_id_seq
+func identitySequenceName(alterTable, line string) (string, bool) {
+	if !strings.HasSuffix(alterTable, " AS IDENTITY (") {
+		return "", false
+	}
+	name, found := strings.CutPrefix(strings.TrimSpace(line), "SEQUENCE NAME ")
+	if !found {
+		return "", false
+	}
+	qualifiedName, err := pglib.NewQualifiedName(name)
+	if err != nil {
+		return "", false
+	}
+	return qualifiedName.String(), true
 }
 
 func (s *SnapshotGenerator) dumpRoles(ctx context.Context, rolesInSchemaDump map[string]role) ([]byte, error) {
@@ -382,15 +1005,19 @@ func (s *SnapshotGenerator) restoreSchemas(ctx context.Context, schemaTables map
 		}
 	}
 
-	return s.restoreDump(ctx, []byte(schemaDump.String()))
+	return s.restoreDump(ctx, phaseSchemas, []byte(schemaDump.String()))
 }
 
-func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte) error {
+func (s *SnapshotGenerator) restoreDump(ctx context.Context, phase string, dump []byte) error {
+	return s.restoreDumpWithOptions(ctx, phase, s.optionGenerator.pgrestoreOptions(), dump)
+}
+
+func (s *SnapshotGenerator) restoreDumpWithOptions(ctx context.Context, phase string, opts pglib.PGRestoreOptions, dump []byte) error {
 	if len(dump) == 0 {
 		return nil
 	}
 
-	_, err := s.pgRestoreFn(ctx, s.optionGenerator.pgrestoreOptions(), dump)
+	_, err := s.pgRestoreFn(ctx, opts, dump)
 	pgrestoreErr := &pglib.PGRestoreErrors{}
 	if err != nil {
 		switch {
@@ -399,6 +1026,7 @@ func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte) error 
 				return err
 			}
 			ignoredErrors := pgrestoreErr.GetIgnoredErrors()
+			s.recordIgnored(phase, ignoredErrors)
 			s.logger.Warn(err, fmt.Sprintf("restore: %d errors ignored", len(ignoredErrors)), loglib.Fields{"errors_ignored": ignoredErrors})
 		default:
 			return err
@@ -406,6 +1034,106 @@ func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte) error 
 	}
 
 	return nil
+}
+
+// recordIgnored keeps the errors one restore pass chose to ignore, so the
+// summary at the end of CreateSnapshot can report them together.
+func (s *SnapshotGenerator) recordIgnored(phase string, errs []error) {
+	if len(errs) == 0 {
+		return
+	}
+
+	s.ignoredMu.Lock()
+	defer s.ignoredMu.Unlock()
+
+	if s.ignoredByPhase == nil {
+		s.ignoredByPhase = make(map[string][]error)
+	}
+	if _, seen := s.ignoredByPhase[phase]; !seen {
+		s.ignoredPhases = append(s.ignoredPhases, phase)
+	}
+	s.ignoredByPhase[phase] = append(s.ignoredByPhase[phase], errs...)
+}
+
+func (s *SnapshotGenerator) resetIgnored() {
+	s.ignoredMu.Lock()
+	defer s.ignoredMu.Unlock()
+
+	s.ignoredByPhase = nil
+	s.ignoredPhases = nil
+}
+
+// summariseIgnored reports, once, what the restore passes left out.
+//
+// Each pass already logs how many errors it ignored, at the moment it ignores
+// them. That tells an operator that something was skipped, but not what, and
+// never the whole picture: the passes are minutes apart, the data load sits
+// between two of them, and nothing adds the counts up. Finding out whether the
+// target is complete means reading the raw error text of every pass and joining
+// it by hand.
+//
+// This reports and never fails. Which of these matter is a separate question,
+// and answering it needs to know what produced each error rather than what the
+// error says; nothing here moves an error out of the bucket the restore put it
+// in, and a restore that succeeds today still succeeds.
+func (s *SnapshotGenerator) summariseIgnored() {
+	s.ignoredMu.Lock()
+	defer s.ignoredMu.Unlock()
+
+	if len(s.ignoredPhases) == 0 {
+		return
+	}
+
+	total := 0
+	byPhase := make(map[string]int, len(s.ignoredPhases))
+	notApplied := make([]map[string]string, 0, len(s.ignoredPhases))
+	for _, phase := range s.ignoredPhases {
+		for _, err := range s.ignoredByPhase[phase] {
+			total++
+			byPhase[phase]++
+			entry := map[string]string{"phase": phase, "reason": ignoredReason(err)}
+			// The statement is what names the object, and it is the part an
+			// operator is otherwise digging out of the message by eye.
+			var stmtErr *pglib.ErrRestoreStatement
+			if errors.As(err, &stmtErr) {
+				entry["statement"] = stmtErr.Statement()
+			} else {
+				entry["detail"] = err.Error()
+			}
+			notApplied = append(notApplied, entry)
+		}
+	}
+
+	s.logger.Warn(nil, fmt.Sprintf("restore summary: %d statements were not applied", total), loglib.Fields{
+		"by_phase":    byPhase,
+		"not_applied": notApplied,
+	})
+}
+
+// ignoredReason names why the restore let an error pass, so the summary groups
+// by something shorter than the message.
+func ignoredReason(err error) string {
+	var (
+		alreadyExists *pglib.ErrRelationAlreadyExists
+		doesNotExist  *pglib.ErrRelationDoesNotExist
+		permission    *pglib.ErrPermissionDenied
+		constraint    *pglib.ErrConstraintViolation
+		commentOwner  *pglib.ErrCommentOwnership
+	)
+	switch {
+	case errors.As(err, &alreadyExists):
+		return "relation already exists"
+	case errors.As(err, &doesNotExist):
+		return "relation does not exist"
+	case errors.As(err, &permission):
+		return "permission denied"
+	case errors.As(err, &constraint):
+		return "constraint violation"
+	case errors.As(err, &commentOwner):
+		return "comment requires object ownership"
+	default:
+		return "unclassified"
+	}
 }
 
 func (s *SnapshotGenerator) parseDump(d []byte) *dump {
@@ -416,20 +1144,75 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 	eventTriggersDump := strings.Builder{}
 	viewsDump := strings.Builder{}
 	sequenceNames := []string{}
+	identitySequenceNames := []string{}
 	dumpRoles := make(map[string]role)
+	connectStatements := []string{}
+	materializedViews := []string{}
 	alterTable := ""
 	createEventTrigger := ""
-	createView := ""
+	createView := []string{}
+	createViewIsMaterialized := false
+	createRule := []string{}
+	functionParser := &sqlFunctionParser{}
+	materializedViewNames := map[string]struct{}{}
+	skipLegacyPLPGSQLHandlerFunction := false
+
+	// Object type filtering state: lines before the first TOC header (the
+	// preamble) are always included. Once a TOC header is encountered, the
+	// section is included/excluded based on the filter.
+	inPreamble := true
+	skipCurrentSection := false
+
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Check for TOC header to track object type sections
+		if tocType, ok := parseTOCHeader(line); ok {
+			inPreamble = false
+			skipCurrentSection = s.objectTypeFilter.isExcluded(tocType)
+		}
+
+		// If the current section is excluded, skip the line. We still
+		// need to extract role information from non-excluded sections
+		// for role dependency tracking.
+		if !inPreamble && skipCurrentSection {
+			continue
+		}
+
 		switch {
+		case skipLegacyPLPGSQLHandlerFunction:
+			if strings.HasSuffix(line, ";") {
+				skipLegacyPLPGSQLHandlerFunction = false
+			}
+			continue
+		case isLegacyPLPGSQLHandlerFunctionStart(line):
+			skipLegacyPLPGSQLHandlerFunction = !strings.HasSuffix(line, ";")
+			continue
+		case functionParser.inProgress || isSQLFunctionStart(line):
+			if statement, deferred, done := functionParser.addLine(line); done {
+				if deferred {
+					// functions with SQL-standard bodies (BEGIN ATOMIC/RETURN)
+					// are parsed and validated at creation time, so they can
+					// rely on indices and constraints existing (e.g. GROUP BY
+					// primary key functional dependency) and must be restored
+					// after them, along with the views
+					viewsDump.WriteString(strings.Join(statement, "\n"))
+					viewsDump.WriteString("\n\n")
+				} else {
+					filteredDump.WriteString(strings.Join(statement, "\n"))
+					filteredDump.WriteString("\n")
+				}
+			}
 		case strings.HasPrefix(line, "SECURITY LABEL") &&
 			isSecurityLabelForExcludedProvider(line, s.excludedSecurityLabels):
 			// skip security labels if configured to do so for the specified providers
 			continue
 		case alterTable != "":
+			if name, ok := identitySequenceName(alterTable, line); ok {
+				identitySequenceNames = append(identitySequenceNames, name)
+			}
 			// check if the previous alter table line is split in two lines and matches a constraint
-			if strings.Contains(line, "ADD CONSTRAINT") {
+			if strings.Contains(line, "ADD CONSTRAINT") || isClusterOnAlterTable(line) {
 				indicesAndConstraints.WriteString(alterTable)
 				indicesAndConstraints.WriteString("\n")
 				indicesAndConstraints.WriteString(line)
@@ -456,29 +1239,57 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			eventTriggersDump.WriteString(line)
 			eventTriggersDump.WriteString("\n")
 
-		case strings.HasPrefix(line, "CREATE VIEW"),
-			strings.HasPrefix(line, "CREATE MATERIALIZED VIEW"):
-			createView = line
-			fallthrough
-		case createView != "":
-			if strings.HasSuffix(line, ";") {
-				viewsDump.WriteString(line)
-				viewsDump.WriteString("\n\n")
-				createView = ""
-				continue
+		case len(createView) > 0 || isViewStatementStart(line):
+			if len(createView) == 0 {
+				if name, ok := materializedViewName(line); ok {
+					materializedViewNames[name] = struct{}{}
+					materializedViews = append(materializedViews, name)
+				}
+				createViewIsMaterialized = strings.HasPrefix(line, "CREATE MATERIALIZED VIEW")
 			}
-			viewsDump.WriteString(line)
-			viewsDump.WriteString("\n")
+			createView = append(createView, line)
+			if strings.HasSuffix(line, ";") {
+				statement := strings.Join(createView, "\n")
+				if !createViewIsMaterialized && isDummyViewStatement(createView) {
+					// pg_dump breaks circular view dependencies by emitting a
+					// dummy view (a bare SELECT of NULL casts with no FROM
+					// clause) upfront and the real definition (CREATE OR
+					// REPLACE VIEW) at the end of the dump. The dummy must be
+					// restored early so that objects in the main schema dump
+					// referencing the view row type (e.g. functions) can be
+					// created; it cannot depend on indices or constraints.
+					filteredDump.WriteString(statement)
+					filteredDump.WriteString("\n")
+				} else {
+					viewsDump.WriteString(statement)
+					viewsDump.WriteString("\n\n")
+				}
+				createView = []string{}
+			}
+		case len(createRule) > 0 || strings.HasPrefix(line, `CREATE RULE "_RETURN" AS`):
+			// older pg_dump versions break circular view dependencies with a
+			// dummy table converted into a view by a _RETURN rule; the rule
+			// body is validated at creation time, so it is restored along
+			// with the views, after indices and constraints
+			createRule = append(createRule, line)
+			if strings.HasSuffix(line, ";") {
+				viewsDump.WriteString(strings.Join(createRule, "\n"))
+				viewsDump.WriteString("\n\n")
+				createRule = []string{}
+			}
 
 		case strings.Contains(line, `\connect`):
+			connectStatements = append(connectStatements, line)
 			indicesAndConstraints.WriteString(line)
 			indicesAndConstraints.WriteString("\n\n")
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
 			viewsDump.WriteString(line)
 			viewsDump.WriteString("\n\n")
-		case strings.HasPrefix(line, "CREATE INDEX"),
-			strings.HasPrefix(line, "CREATE UNIQUE INDEX"),
+		case isIndexStatement(line) && isIndexOnMaterializedView(line, materializedViewNames):
+			viewsDump.WriteString(line)
+			viewsDump.WriteString("\n\n")
+		case isIndexStatement(line),
 			strings.HasPrefix(line, "CREATE CONSTRAINT"),
 			strings.HasPrefix(line, "CREATE TRIGGER"),
 			strings.HasPrefix(line, "COMMENT ON CONSTRAINT"),
@@ -488,6 +1299,20 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			indicesAndConstraints.WriteString("\n\n")
 		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "ADD CONSTRAINT"):
 			indicesAndConstraints.WriteString(line)
+			// the separator keeps this statement from being glued to the next
+			// one, which would hide the statement that follows it from the
+			// block splitting the restore does
+			indicesAndConstraints.WriteString("\n\n")
+		case strings.HasPrefix(line, "ALTER TABLE") && isClusterOnAlterTable(line):
+			indicesAndConstraints.WriteString(line)
+			indicesAndConstraints.WriteString("\n\n")
+		case isAttachPartitionIndexStatement(line):
+			// ATTACH PARTITION references the parent index, which is created in
+			// the indices and constraints section. Restored in place it runs
+			// before that index exists, fails with "relation does not exist",
+			// and is never retried, leaving the parent index invalid.
+			indicesAndConstraints.WriteString(line)
+			indicesAndConstraints.WriteString("\n\n")
 		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "REPLICA IDENTITY"):
 			// REPLICA IDENTITY lines should be in the indicesAndConstraints section
 			// since they reference constraints/indices that are also there
@@ -538,14 +1363,185 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 	}
 
 	return &dump{
-		full:                  d,
-		filtered:              []byte(filteredDump.String()),
-		indicesAndConstraints: []byte(indicesAndConstraints.String()),
-		views:                 []byte(viewsDump.String()),
-		sequences:             sequenceNames,
-		roles:                 dumpRoles,
-		eventTriggers:         []byte(eventTriggersDump.String()),
+		full:                      d,
+		filtered:                  []byte(filteredDump.String()),
+		indicesAndConstraints:     []byte(indicesAndConstraints.String()),
+		views:                     []byte(viewsDump.String()),
+		materializedViewRefreshes: materializedViewRefreshDump(connectStatements, materializedViews),
+		sequences:                 sequenceNames,
+		identitySequences:         identitySequenceNames,
+		roles:                     dumpRoles,
+		eventTriggers:             []byte(eventTriggersDump.String()),
 	}
+}
+
+func isClusterOnAlterTable(line string) bool {
+	return strings.Contains(line, " CLUSTER ON ")
+}
+
+func isViewStatementStart(line string) bool {
+	return strings.HasPrefix(line, "CREATE VIEW ") ||
+		strings.HasPrefix(line, "CREATE OR REPLACE VIEW ") ||
+		strings.HasPrefix(line, "CREATE MATERIALIZED VIEW ")
+}
+
+// isDummyViewStatement returns true if the view statement matches the
+// placeholder pg_dump emits to break circular view dependencies: a bare
+// SELECT of NULL-cast columns with no FROM clause, e.g.
+//
+//	CREATE VIEW public.v AS
+//	SELECT
+//	    NULL::integer AS id,
+//	    NULL::text AS name;
+func isDummyViewStatement(lines []string) bool {
+	if len(lines) < 3 || strings.TrimSpace(lines[1]) != "SELECT" {
+		return false
+	}
+	for _, line := range lines[2:] {
+		column := strings.TrimSpace(strings.TrimRight(line, ";,"))
+		if !strings.HasPrefix(column, "NULL::") {
+			return false
+		}
+	}
+	return true
+}
+
+func isSQLFunctionStart(line string) bool {
+	return strings.HasPrefix(line, "CREATE FUNCTION ") ||
+		strings.HasPrefix(line, "CREATE OR REPLACE FUNCTION ") ||
+		strings.HasPrefix(line, "CREATE PROCEDURE ") ||
+		strings.HasPrefix(line, "CREATE OR REPLACE PROCEDURE ")
+}
+
+// sqlFunctionParser buffers the beginning of a CREATE FUNCTION/PROCEDURE
+// statement until pg_dump's body introduction reveals its style:
+//
+//   - `AS ...` (classic string/dollar quoted body): the body is only parsed
+//     on execution, so the statement can be restored in place. The parser
+//     stops and hands the buffered lines back; the rest of the statement
+//     doesn't need buffering and flows through the regular dump parsing,
+//     unchanged.
+//   - `BEGIN ATOMIC <statements> END;` or `RETURN <expression>;`
+//     (SQL-standard body): the body is parsed and validated at creation time,
+//     so it can rely on indices and constraints existing (e.g. GROUP BY
+//     primary key functional dependency) and must be deferred. These bodies
+//     are deparsed plain SQL with no quoting, so the statement end can be
+//     detected without tracking dollar quotes.
+//
+// The lines between the header and the body introduction are attribute lines
+// (LANGUAGE, IMMUTABLE, SET, COST, ...) and cannot contain quoted bodies.
+type sqlFunctionParser struct {
+	inProgress bool
+	lines      []string
+	atomicBody bool
+	returnBody bool
+}
+
+// addLine buffers the line and reports whether the parser is finished with
+// the statement. Once done, statement holds the buffered lines and deferred
+// indicates whether they are a SQL-standard body function that needs to be
+// restored after indices and constraints.
+func (p *sqlFunctionParser) addLine(line string) (statement []string, deferred, done bool) {
+	p.inProgress = true
+	p.lines = append(p.lines, line)
+	trimmedLine := strings.TrimSpace(line)
+	switch {
+	case p.atomicBody:
+		// pg_dump places the closing END of the atomic body on its own line
+		if trimmedLine == "END;" {
+			return p.finish(true)
+		}
+	case p.returnBody:
+		if strings.HasSuffix(line, ";") {
+			return p.finish(true)
+		}
+	case trimmedLine == "BEGIN ATOMIC":
+		p.atomicBody = true
+	case strings.HasPrefix(trimmedLine, "RETURN ") || strings.HasPrefix(trimmedLine, "RETURN("):
+		// the RETURNS clause of the header cannot match, since the first line
+		// of the statement always starts with CREATE
+		if strings.HasSuffix(line, ";") {
+			return p.finish(true)
+		}
+		p.returnBody = true
+	case strings.HasPrefix(trimmedLine, "AS "),
+		strings.HasSuffix(line, ";"):
+		// classic quoted body or end of statement without a recognized
+		// SQL-standard body: restore in place
+		return p.finish(false)
+	}
+	return nil, false, false
+}
+
+func (p *sqlFunctionParser) finish(deferred bool) ([]string, bool, bool) {
+	statement := p.lines
+	*p = sqlFunctionParser{}
+	return statement, deferred, true
+}
+
+func isLegacyPLPGSQLHandlerFunctionStart(line string) bool {
+	return strings.HasPrefix(line, "CREATE FUNCTION public.plpgsql_call_handler() RETURNS language_handler") ||
+		strings.HasPrefix(line, "CREATE FUNCTION public.plpgsql_validator(oid) RETURNS void")
+}
+
+func materializedViewRefreshDump(connectStatements, materializedViews []string) []byte {
+	if len(materializedViews) == 0 {
+		return nil
+	}
+
+	refreshDump := strings.Builder{}
+	for _, statement := range connectStatements {
+		refreshDump.WriteString(statement)
+		refreshDump.WriteString("\n\n")
+	}
+	for _, view := range materializedViews {
+		fmt.Fprintf(&refreshDump, "REFRESH MATERIALIZED VIEW %s WITH DATA;\n\n", view)
+	}
+	return []byte(refreshDump.String())
+}
+
+func isIndexStatement(line string) bool {
+	return strings.HasPrefix(line, "CREATE INDEX") ||
+		strings.HasPrefix(line, "CREATE UNIQUE INDEX")
+}
+
+// isAttachPartitionIndexStatement reports whether the line attaches a partition
+// index to its parent. pg_dump emits these for partitioned tables, after the
+// CREATE INDEX statements they depend on.
+func isAttachPartitionIndexStatement(line string) bool {
+	return strings.HasPrefix(line, "ALTER INDEX") &&
+		strings.Contains(line, "ATTACH PARTITION")
+}
+
+func materializedViewName(line string) (string, bool) {
+	if !strings.HasPrefix(line, "CREATE MATERIALIZED VIEW ") {
+		return "", false
+	}
+
+	name := strings.TrimPrefix(line, "CREATE MATERIALIZED VIEW ")
+	if idx := strings.Index(name, " AS"); idx >= 0 {
+		return strings.TrimSpace(name[:idx]), true
+	}
+	return "", false
+}
+
+func isIndexOnMaterializedView(line string, materializedViewNames map[string]struct{}) bool {
+	if len(materializedViewNames) == 0 {
+		return false
+	}
+
+	onIdx := strings.Index(line, " ON ")
+	if onIdx < 0 {
+		return false
+	}
+	rest := line[onIdx+len(" ON "):]
+	usingIdx := strings.Index(rest, " USING ")
+	if usingIdx < 0 {
+		return false
+	}
+
+	_, ok := materializedViewNames[strings.TrimSpace(rest[:usingIdx])]
+	return ok
 }
 
 func (s *SnapshotGenerator) filterTriggers(eventTriggersDump []byte, excludedSchemas []string) []byte {
@@ -628,7 +1624,7 @@ func (s *SnapshotGenerator) removeRestrictedRoleAttributes(line string) string {
 	if len(roles) == 0 {
 		return line
 	}
-	line += fmt.Sprintf("\nGRANT rds_replication TO %s;", roles[0].name)
+	line += fmt.Sprintf("\nGRANT rds_replication TO %s;", pglib.QuoteIdentifier(roles[0].name))
 	return line
 }
 
@@ -673,7 +1669,7 @@ func (s *SnapshotGenerator) getDumpFileName(suffix string) string {
 	return baseName + suffix + fileExtension
 }
 
-func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, dump []byte) error {
+func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, opts pglib.PGRestoreOptions, dump []byte) error {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	trackingCtx, cancel := context.WithCancel(ctx)
@@ -682,7 +1678,7 @@ func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, dump
 		defer wg.Done()
 		s.snapshotTracker.trackIndexesCreation(trackingCtx)
 	}()
-	err := s.restoreDump(ctx, dump)
+	err := s.restoreIndexDump(ctx, opts, dump)
 	// wait for the tracking to finish once the restore is done
 	cancel()
 	wg.Wait()
@@ -691,6 +1687,21 @@ func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, dump
 
 func hasWildcardTable(tables []string) bool {
 	return slices.Contains(tables, wildcard)
+}
+
+// mergeTables returns the deduplicated union of both table lists, collapsing
+// to the wildcard if either list contains it.
+func mergeTables(t1, t2 []string) []string {
+	if hasWildcardTable(t1) || hasWildcardTable(t2) {
+		return []string{wildcard}
+	}
+	merged := slices.Clone(t1)
+	for _, table := range t2 {
+		if !slices.Contains(merged, table) {
+			merged = append(merged, table)
+		}
+	}
+	return merged
 }
 
 func hasWildcardSchema(schemaTables map[string][]string) bool {

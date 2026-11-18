@@ -7,6 +7,7 @@
         "string",
         "citext"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "replacement_domain",
@@ -32,11 +33,105 @@
       ]
     },
     {
+      "name": "encrypted_aes_siv",
+      "supported_types": [
+        "string",
+        "byte_array"
+      ],
+      "uniqueness": "preserved",
+      "parameters": [
+        {
+          "name": "key_hex",
+          "supported_type": "string",
+          "default": null,
+          "dynamic": false,
+          "required": true
+        },
+        {
+          "name": "associated_data",
+          "supported_type": "string",
+          "default": "",
+          "dynamic": false,
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "fpe_ff1",
+      "supported_types": [
+        "string"
+      ],
+      "uniqueness": "preserved",
+      "parameters": [
+        {
+          "name": "key_hex",
+          "supported_type": "string",
+          "default": null,
+          "dynamic": false,
+          "required": true
+        },
+        {
+          "name": "associated_data",
+          "supported_type": "string",
+          "default": "",
+          "dynamic": false,
+          "required": false
+        },
+        {
+          "name": "alphabet",
+          "supported_type": "string",
+          "default": "digits",
+          "dynamic": false,
+          "required": false
+        },
+        {
+          "name": "passthrough",
+          "supported_type": "string",
+          "default": "keep",
+          "dynamic": false,
+          "required": false,
+          "values": [
+            "keep",
+            "error"
+          ]
+        },
+        {
+          "name": "keep_prefix",
+          "supported_type": "int",
+          "default": 0,
+          "dynamic": false,
+          "required": false
+        },
+        {
+          "name": "keep_suffix",
+          "supported_type": "int",
+          "default": 0,
+          "dynamic": false,
+          "required": false
+        },
+        {
+          "name": "min_length",
+          "supported_type": "int",
+          "default": 0,
+          "dynamic": false,
+          "required": false
+        },
+        {
+          "name": "preserve_from",
+          "supported_type": "string",
+          "default": "",
+          "dynamic": false,
+          "required": false
+        }
+      ]
+    },
+    {
       "name": "greenmask_boolean",
       "supported_types": [
         "boolean",
         "byte_array"
       ],
+      "uniqueness": "lossy",
       "parameters": [
         {
           "name": "generator",
@@ -55,8 +150,10 @@
       "name": "greenmask_choice",
       "supported_types": [
         "string",
-        "byte_array"
+        "byte_array",
+        "enum"
       ],
+      "uniqueness": "lossy",
       "parameters": [
         {
           "name": "choices",
@@ -85,6 +182,7 @@
         "byte_array",
         "date"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "generator",
@@ -119,6 +217,7 @@
         "string",
         "byte_array"
       ],
+      "uniqueness": "lossy",
       "parameters": [
         {
           "name": "generator",
@@ -152,6 +251,7 @@
         "float64",
         "byte_array"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "generator",
@@ -202,6 +302,7 @@
         "float32",
         "float64"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "generator",
@@ -247,6 +348,7 @@
         "string",
         "byte_array"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "symbols",
@@ -297,6 +399,7 @@
         "float32",
         "float64"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "generator",
@@ -332,6 +435,7 @@
         "byte_array",
         "string"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "generator",
@@ -386,6 +490,7 @@
         "uuid",
         "uint8_array_of_16"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "generator",
@@ -407,6 +512,7 @@
         "byte_array",
         "hstore"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "operations",
@@ -422,6 +528,7 @@
       "supported_types": [
         "json"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "operations",
@@ -437,6 +544,7 @@
       "supported_types": [
         "all"
       ],
+      "uniqueness": "lossy",
       "parameters": [
         {
           "name": "literal",
@@ -448,11 +556,78 @@
       ]
     },
     {
+      "name": "lookup_choice",
+      "supported_types": [
+        "string",
+        "citext",
+        "byte_array",
+        "boolean",
+        "integer16",
+        "integer32",
+        "integer64",
+        "float32",
+        "float64",
+        "uint8_array_of_16",
+        "date",
+        "datetime"
+      ],
+      "uniqueness": "lossy",
+      "parameters": [
+        {
+          "name": "lookup_table",
+          "supported_type": "string",
+          "default": null,
+          "dynamic": false,
+          "required": true
+        },
+        {
+          "name": "lookup_column",
+          "supported_type": "string",
+          "default": null,
+          "dynamic": false,
+          "required": true
+        },
+        {
+          "name": "postgres_url",
+          "supported_type": "string",
+          "default": null,
+          "dynamic": false,
+          "required": true
+        },
+        {
+          "name": "generator",
+          "supported_type": "string",
+          "default": "random",
+          "dynamic": false,
+          "required": false,
+          "values": [
+            "random",
+            "deterministic"
+          ]
+        },
+        {
+          "name": "max_values",
+          "supported_type": "integer",
+          "default": 100000,
+          "dynamic": false,
+          "required": false
+        },
+        {
+          "name": "ignore_values",
+          "supported_type": "array",
+          "default": null,
+          "dynamic": false,
+          "required": false
+        }
+      ]
+    },
+    {
       "name": "masking",
       "supported_types": [
         "string",
         "byte_array"
       ],
+      "uniqueness": "lossy",
       "parameters": [
         {
           "name": "type",
@@ -510,6 +685,7 @@
         "string",
         "citext"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "seed",
@@ -578,6 +754,7 @@
       "supported_types": [
         "string"
       ],
+      "uniqueness": "lossy",
       "parameters": [
         {
           "name": "seed",
@@ -607,6 +784,7 @@
       "supported_types": [
         "string"
       ],
+      "uniqueness": "lossy",
       "parameters": [
         {
           "name": "seed",
@@ -636,6 +814,7 @@
       "supported_types": [
         "string"
       ],
+      "uniqueness": "lossy",
       "parameters": [
         {
           "name": "seed",
@@ -665,6 +844,7 @@
       "supported_types": [
         "string"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "seed",
@@ -701,6 +881,7 @@
       "supported_types": [
         "all"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "anon_function",
@@ -850,6 +1031,7 @@
         "string",
         "byte_array"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "prefix",
@@ -891,14 +1073,15 @@
         "string",
         "byte_array"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": []
     },
     {
       "name": "template",
       "supported_types": [
-        "string",
-        "byte_array"
+        "all"
       ],
+      "uniqueness": "not_guaranteed",
       "parameters": [
         {
           "name": "template",

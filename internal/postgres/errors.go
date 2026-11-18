@@ -5,6 +5,7 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -32,6 +33,14 @@ func (e *ErrConstraintViolation) Error() string {
 	return fmt.Sprintf("constraint violation: %s", e.Details)
 }
 
+type ErrCommentOwnership struct {
+	Details string
+}
+
+func (e *ErrCommentOwnership) Error() string {
+	return fmt.Sprintf("comment not restored, requires object ownership: %s", e.Details)
+}
+
 type ErrPermissionDenied struct {
 	Details string
 }
@@ -54,6 +63,17 @@ type ErrDataException struct {
 
 func (e *ErrDataException) Error() string {
 	return fmt.Sprintf("data exception: %s", e.Details)
+}
+
+// ErrTransientFailure reports a failure that is not caused by the statement
+// being restored, such as a dropped connection or a lock that could not be
+// acquired in time. The same statement can succeed if it is run again.
+type ErrTransientFailure struct {
+	Details string
+}
+
+func (e *ErrTransientFailure) Error() string {
+	return fmt.Sprintf("transient failure: %s", e.Details)
 }
 
 type ErrRelationAlreadyExists struct {
@@ -103,6 +123,26 @@ type ErrFeatureNotSupported struct {
 func (e *ErrFeatureNotSupported) Error() string {
 	return fmt.Sprintf("feature not supported: %s", e.Details)
 }
+
+type ErrActiveSQLTransaction struct {
+	Details string
+}
+
+func (e *ErrActiveSQLTransaction) Error() string {
+	return fmt.Sprintf("active sql transaction: %s", e.Details)
+}
+
+type ErrValueEncoding struct {
+	Details string
+}
+
+func (e *ErrValueEncoding) Error() string {
+	return fmt.Sprintf("value encoding: %s", e.Details)
+}
+
+const encodeArgsErrFragment = "failed to encode args["
+
+var encodeArgsErrDetails = regexp.MustCompile(`^(.*?failed to encode args\[\d+\]).*?(for [^:]+)`)
 
 // MapError maps a Postgres error to a more specific error type
 func MapError(err error) error {
@@ -157,6 +197,11 @@ func MapError(err error) error {
 					Details: pgErr.Message,
 				}
 			}
+		case "25001":
+			// 25001 	active_sql_transaction
+			return &ErrActiveSQLTransaction{
+				Details: pgErr.Message,
+			}
 		case "0A000":
 			// 0A000 	feature_not_supported
 			return &ErrFeatureNotSupported{
@@ -180,7 +225,7 @@ func MapError(err error) error {
 		// Class 22 — Data Exception
 		if strings.HasPrefix(pgErr.Code, "22") {
 			return &ErrDataException{
-				Details: pgErr.Message,
+				Details: withErrorContext(pgErr),
 			}
 		}
 		// Class 23 — Integrity Constraint Violation
@@ -198,5 +243,29 @@ func MapError(err error) error {
 		}
 	}
 
+	// A client-side encoding failure is recognized last, and only when nothing
+	// carried a SQLSTATE: it never reaches the server, so it can never be a
+	// PgError. Checking it earlier would let a genuine server error whose
+	// message happens to quote the fragment — postgres embeds row values in
+	// messages, and pgstream is often pointed at tables holding log text — be
+	// misclassified, changing how the writer and the retrier handle it.
+	if err != nil && pgErr == nil && strings.Contains(err.Error(), encodeArgsErrFragment) {
+		return &ErrValueEncoding{Details: encodingErrDetails(err.Error())}
+	}
+
 	return err
+}
+
+func withErrorContext(pgErr *pgconn.PgError) string {
+	if pgErr.Where == "" {
+		return pgErr.Message
+	}
+	return fmt.Sprintf("%s (%s)", pgErr.Message, pgErr.Where)
+}
+
+func encodingErrDetails(msg string) string {
+	if m := encodeArgsErrDetails.FindStringSubmatch(msg); m != nil {
+		return m[1] + " " + m[2]
+	}
+	return encodeArgsErrFragment
 }

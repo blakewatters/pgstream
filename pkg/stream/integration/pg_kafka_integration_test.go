@@ -25,8 +25,10 @@ func Test_PostgresToKafka(t *testing.T) {
 		t.Skip("skipping integration test...")
 	}
 
+	kafkaContainer.require(t)
+
 	cfg := &stream.Config{
-		Listener:  testPostgresListenerCfg(),
+		Listener:  testPostgresListenerCfg(t),
 		Processor: testKafkaProcessorCfg(),
 	}
 
