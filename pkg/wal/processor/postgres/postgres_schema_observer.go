@@ -35,7 +35,10 @@ type pgSchemaObserver struct {
 	alwaysIdentityTableColumns *synclib.Map[string, map[string]struct{}]
 	// materializedViews is a map of schema name to a set of materialized view names.
 	materializedViews *synclib.Map[string, map[string]struct{}]
-	// columnTableSequences is a map of schema.table to a map of sequence column names.
+	// columnTableSequences is a map of schema.table to a map of sequence column
+	// names to their sequence name. The sequence name is empty for an identity
+	// column learnt from a DDL event, which does not carry it: the target then
+	// resolves the owned sequence when the setval query runs.
 	columnTableSequences *synclib.Map[string, map[string]string]
 	// enumTableColumns is a map of schema.table to the quoted column names whose
 	// type resolves to a user-defined enum, each with the catalog-resolved
@@ -48,6 +51,12 @@ type pgSchemaObserver struct {
 	// meant to drop it. Lookups record the epoch before querying and only
 	// cache the result if it has not moved.
 	enumCacheEpoch atomic.Uint64
+	// compositeTableColumns is a map of schema.table to the quoted column names
+	// whose type resolves to a composite type.
+	compositeTableColumns *synclib.Map[string, map[string]struct{}]
+	// compositeCacheEpoch guards compositeTableColumns the way enumCacheEpoch
+	// guards enumTableColumns.
+	compositeCacheEpoch atomic.Uint64
 	// primaryKeyTableColumns is a map of schema.table to the quoted names of
 	// its primary key columns, empty for a table without one.
 	primaryKeyTableColumns *synclib.Map[string, []string]
@@ -90,6 +99,7 @@ func newPGSchemaObserver(ctx context.Context, cfg *Config, logger loglib.Logger,
 		materializedViews:          synclib.NewMap[string, map[string]struct{}](),
 		columnTableSequences:       synclib.NewMap[string, map[string]string](),
 		enumTableColumns:           synclib.NewMap[string, map[string]enumColumn](),
+		compositeTableColumns:      synclib.NewMap[string, map[string]struct{}](),
 		primaryKeyTableColumns:     synclib.NewMap[string, []string](),
 		logger:                     logger,
 	}, nil
@@ -202,6 +212,31 @@ func (o *pgSchemaObserver) getEnumColumnNames(ctx context.Context, schema, table
 	return colNames, nil
 }
 
+// getCompositeColumnNames returns the set of quoted column names for the given
+// schema.table whose type is a composite type. If not cached, it queries
+// postgres.
+func (o *pgSchemaObserver) getCompositeColumnNames(ctx context.Context, schema, table string) (map[string]struct{}, error) {
+	key := pglib.QuoteQualifiedIdentifier(schema, table)
+
+	columns, found := o.compositeTableColumns.Get(key)
+	if found {
+		return columns, nil
+	}
+
+	epoch := o.compositeCacheEpoch.Load()
+	colNames, err := o.queryCompositeColumnNames(ctx, schema, table)
+	if err != nil {
+		return nil, err
+	}
+
+	// same race as getEnumColumnNames: a DDL may have invalidated the entry
+	// while the query was in flight.
+	if o.compositeCacheEpoch.Load() == epoch {
+		o.compositeTableColumns.Set(key, colNames)
+	}
+	return colNames, nil
+}
+
 // getPrimaryKeyColumns returns the quoted primary key column names for the
 // given schema.table. If not cached, it queries postgres.
 func (o *pgSchemaObserver) getPrimaryKeyColumns(ctx context.Context, schema, table string) ([]string, error) {
@@ -245,6 +280,11 @@ func (o *pgSchemaObserver) getSchemaInfo(ctx context.Context, schema, table stri
 		return schemaInfo{}, err
 	}
 
+	compositeColumns, err := o.getCompositeColumnNames(ctx, schema, table)
+	if err != nil {
+		return schemaInfo{}, err
+	}
+
 	primaryKeyColumns, err := o.getPrimaryKeyColumns(ctx, schema, table)
 	if err != nil {
 		return schemaInfo{}, err
@@ -255,6 +295,7 @@ func (o *pgSchemaObserver) getSchemaInfo(ctx context.Context, schema, table stri
 		alwaysIdentityColumns: alwaysIdentityColumns,
 		sequenceColumns:       sequenceColumns,
 		enumColumns:           enumColumns,
+		compositeColumns:      compositeColumns,
 		primaryKeyColumns:     primaryKeyColumns,
 	}, nil
 }
@@ -268,6 +309,7 @@ func (o *pgSchemaObserver) update(ddlEvent *wal.DDLEvent) {
 	o.updateGeneratedColumnNames(tableObjects)
 	o.updateColumnSequences(tableObjects)
 	o.invalidateEnumColumns(tableObjects)
+	o.invalidateCompositeColumns(tableObjects)
 	o.updatePrimaryKeyColumns(ddlEvent.GetTableObjects())
 	mvObjects := ddlEvent.GetMaterializedViewObjects()
 	if len(mvObjects) > 0 {
@@ -276,12 +318,12 @@ func (o *pgSchemaObserver) update(ddlEvent *wal.DDLEvent) {
 }
 
 // updateGeneratedColumnNames will update the internal cache with the table
-// columns for the schema log on input. Identity columns are added to
-// generatedColumns via IsGenerated() (preserved historical behavior so live
-// INSERTs let the target auto-generate ids and the sequence increments
-// naturally). GENERATED ALWAYS AS IDENTITY columns are additionally tracked in
-// alwaysIdentityTableColumns so UPDATE SET clauses can drop them even on
-// cache paths where generatedColumns is empty (e.g. populated via SQL query).
+// columns for the schema log on input. Identity columns are not generated
+// columns: INSERTs write the source value with OVERRIDING SYSTEM VALUE and then
+// move the target sequence with setval, so source and target ids stay the same.
+// This matches the columns queried from postgres (attgenerated only).
+// GENERATED ALWAYS AS IDENTITY columns are tracked in alwaysIdentityTableColumns
+// so UPDATE SET clauses can drop them.
 func (o *pgSchemaObserver) updateGeneratedColumnNames(tables []wal.DDLObject) {
 	for _, table := range tables {
 		key := pglib.QuoteQualifiedIdentifier(table.Schema, table.GetName())
@@ -291,7 +333,7 @@ func (o *pgSchemaObserver) updateGeneratedColumnNames(tables []wal.DDLObject) {
 			if c.IsAlwaysIdentity() {
 				alwaysIdentityColumns[pglib.QuoteIdentifier(c.Name)] = struct{}{}
 			}
-			if c.IsGenerated() {
+			if c.Generated {
 				generatedColumns[pglib.QuoteIdentifier(c.Name)] = struct{}{}
 			}
 		}
@@ -331,20 +373,6 @@ func (o *pgSchemaObserver) updateMaterializedViews(ddlEvent *wal.DDLEvent, mvs [
 	}
 }
 
-// updatePrimaryKeyColumns sets the cached primary key of each table from the
-// DDL event, which carries it as of the statement. Only table objects do: a
-// table column object names a column, and has no key of its own.
-func (o *pgSchemaObserver) updatePrimaryKeyColumns(tables []wal.DDLObject) {
-	for _, table := range tables {
-		key := pglib.QuoteQualifiedIdentifier(table.Schema, table.GetTable())
-		columns := make([]string, 0, len(table.PrimaryKeyColumns))
-		for _, name := range table.PrimaryKeyColumns {
-			columns = append(columns, pglib.QuoteIdentifier(name))
-		}
-		o.primaryKeyTableColumns.Set(key, columns)
-	}
-}
-
 func (o *pgSchemaObserver) updateColumnSequences(tables []wal.DDLObject) {
 	for _, table := range tables {
 		key := pglib.QuoteQualifiedIdentifier(table.Schema, table.GetName())
@@ -375,6 +403,30 @@ func (o *pgSchemaObserver) invalidateEnumColumns(tables []wal.DDLObject) {
 	for _, table := range tables {
 		key := pglib.QuoteQualifiedIdentifier(table.Schema, table.GetTable())
 		o.enumTableColumns.Delete(key)
+	}
+}
+
+// updatePrimaryKeyColumns sets the cached primary key of each table from the
+// DDL event, which carries it as of the statement. Only table objects do: a
+// table column object names a column, and has no key of its own.
+func (o *pgSchemaObserver) updatePrimaryKeyColumns(tables []wal.DDLObject) {
+	for _, table := range tables {
+		key := pglib.QuoteQualifiedIdentifier(table.Schema, table.GetTable())
+		columns := make([]string, 0, len(table.PrimaryKeyColumns))
+		for _, name := range table.PrimaryKeyColumns {
+			columns = append(columns, pglib.QuoteIdentifier(name))
+		}
+		o.primaryKeyTableColumns.Set(key, columns)
+	}
+}
+
+// invalidateCompositeColumns drops the cached composite-column set for the
+// affected tables, for the same reasons as invalidateEnumColumns.
+func (o *pgSchemaObserver) invalidateCompositeColumns(tables []wal.DDLObject) {
+	o.compositeCacheEpoch.Add(1)
+	for _, table := range tables {
+		key := pglib.QuoteQualifiedIdentifier(table.Schema, table.GetTable())
+		o.compositeTableColumns.Delete(key)
 	}
 }
 
@@ -520,6 +572,54 @@ func (o *pgSchemaObserver) queryEnumColumnNames(ctx context.Context, schemaName,
 	return columns, nil
 }
 
+// compositeTableColumnsQuery returns the columns of a table whose type resolves
+// to a composite type (pg_type.typtype = 'c'). This includes the row type of
+// another table. pgx has no binary codec for such database-specific OIDs, so
+// these columns force text-format COPY. The shapes match
+// enumTableColumnsQuery: a scalar composite, an array of composites, a domain
+// over a composite, and a domain over an array of composites.
+const compositeTableColumnsQuery = `SELECT a.attname
+	FROM pg_attribute a
+	JOIN pg_class c ON c.oid = a.attrelid
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	JOIN pg_type t ON t.oid = a.atttypid
+	LEFT JOIN pg_type elem ON elem.oid = t.typelem
+	LEFT JOIN pg_type base ON base.oid = t.typbasetype
+	LEFT JOIN pg_type baseelem ON baseelem.oid = base.typelem
+	WHERE n.nspname = $1 AND c.relname = $2
+	AND a.attnum > 0 AND NOT a.attisdropped
+	AND (
+		t.typtype = 'c'
+		OR (t.typtype = 'b' AND elem.typtype = 'c')
+		OR (t.typtype = 'd' AND (base.typtype = 'c' OR baseelem.typtype = 'c'))
+	)`
+
+func (o *pgSchemaObserver) queryCompositeColumnNames(ctx context.Context, schemaName, tableName string) (map[string]struct{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, schemaQueryTimeout)
+	defer cancel()
+
+	columns := map[string]struct{}{}
+	rows, err := o.pgConn.Query(ctx, compositeTableColumnsQuery, schemaName, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("getting table composite column names for table %s.%s: %w", schemaName, tableName, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var columnName string
+		if err := rows.Scan(&columnName); err != nil {
+			return nil, fmt.Errorf("scanning table composite column name: %w", err)
+		}
+		columns[pglib.QuoteIdentifier(columnName)] = struct{}{}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return columns, nil
+}
+
 const primaryKeyColumnsQuery = `SELECT a.attname
 	FROM pg_index i
 	JOIN pg_class c ON c.oid = i.indrelid
@@ -582,18 +682,24 @@ func (o *pgSchemaObserver) queryMaterializedViews(ctx context.Context, schemaNam
 	return mvNames, nil
 }
 
+// sequenceColumnQuery returns the sequences owned by the table columns: serial
+// columns (auto dependency) and identity columns (internal dependency). An
+// identity column has no pg_attrdef default, so the query must not require one.
+// An owned sequence cannot move to another schema, so it is always in the table
+// schema.
 const sequenceColumnQuery = `SELECT
     a.attname AS column_name,
     s.relname AS sequence_name
 FROM pg_class t
 JOIN pg_namespace n ON n.oid = t.relnamespace
 JOIN pg_attribute a ON a.attrelid = t.oid
-JOIN pg_attrdef ad ON ad.adrelid = t.oid AND ad.adnum = a.attnum
 JOIN pg_depend d ON d.refobjid = t.oid AND d.refobjsubid = a.attnum
 JOIN pg_class s ON s.oid = d.objid
 WHERE t.relkind = 'r'
     AND s.relkind = 'S'
-    AND d.deptype = 'a'
+    AND d.classid = 'pg_class'::regclass
+    AND d.refclassid = 'pg_class'::regclass
+    AND d.deptype IN ('a', 'i')
     AND n.nspname = $1
     AND t.relname = $2
     AND a.attnum > 0

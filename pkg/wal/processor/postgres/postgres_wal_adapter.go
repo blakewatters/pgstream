@@ -47,6 +47,12 @@ type schemaInfo struct {
 	// target when the event carries no identity metadata, which is every
 	// insert of a pipeline that runs without the injector.
 	primaryKeyColumns []string
+	// compositeColumns is the set of quoted column names whose type resolves to
+	// a composite (row) type. pgx has no binary codec for a composite OID, and
+	// the type name alone cannot tell: a composite may share its name with a
+	// built-in type pgx encodes in binary. Batches touching these columns use
+	// text-format COPY (see needsTextCopyForColumns).
+	compositeColumns map[string]struct{}
 }
 
 // enumColumn describes how to cast a column whose type resolves to a
