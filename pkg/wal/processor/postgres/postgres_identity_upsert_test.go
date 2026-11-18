@@ -123,6 +123,7 @@ func schemaInfoFromDDLEvent(t *testing.T, schemaName, tableName string, columns 
 		columnTableSequences:       synclib.NewMap[string, map[string]string](),
 		enumTableColumns:           synclib.NewMap[string, map[string]enumColumn](),
 		compositeTableColumns:      synclib.NewMap[string, map[string]struct{}](),
+		primaryKeyTableColumns:     synclib.NewMap[string, []string](),
 	}
 
 	observer.update(&wal.DDLEvent{

@@ -515,6 +515,7 @@ func TestPGSchemaObserver_update_invalidatesCompositeColumns(t *testing.T) {
 				alwaysIdentityTableColumns: synclib.NewMap[string, map[string]struct{}](),
 				columnTableSequences:       synclib.NewMap[string, map[string]string](),
 				enumTableColumns:           synclib.NewMap[string, map[string]enumColumn](),
+				primaryKeyTableColumns:     synclib.NewMap[string, []string](),
 				compositeTableColumns: synclib.NewMapFromMap(map[string]map[string]struct{}{
 					quotedTable:      {`"home"`: {}},
 					quotedOtherTable: {`"work"`: {}},
@@ -554,6 +555,7 @@ func TestPGSchemaObserver_getSchemaInfo(t *testing.T) {
 			enumTableColumns:     newSeededMap(failing != "enum", map[string]enumColumn{`"mood"`: {enumType: "public.mood"}}),
 			compositeTableColumns: newSeededMap(failing != "composite",
 				map[string]struct{}{`"home"`: {}}),
+			primaryKeyTableColumns: newSeededPrimaryKeyMap(failing != "primaryKey"),
 		}
 	}
 
@@ -574,6 +576,7 @@ func TestPGSchemaObserver_getSchemaInfo(t *testing.T) {
 				sequenceColumns:       map[string]string{`"id"`: `"test_schema"."seq"`},
 				enumColumns:           map[string]enumColumn{`"mood"`: {enumType: "public.mood"}},
 				compositeColumns:      map[string]struct{}{`"home"`: {}},
+				primaryKeyColumns:     []string{`"id"`},
 			},
 			wantErr: nil,
 		},
@@ -612,6 +615,13 @@ func TestPGSchemaObserver_getSchemaInfo(t *testing.T) {
 			wantInfo: schemaInfo{},
 			wantErr:  errTest,
 		},
+		{
+			name:    "error - primary key columns",
+			failing: "primaryKey",
+
+			wantInfo: schemaInfo{},
+			wantErr:  errTest,
+		},
 	}
 
 	for _, tc := range tests {
@@ -631,6 +641,62 @@ func newSeededMap[T any](seed bool, value map[string]T) *synclib.Map[string, map
 		m.Set(pglib.QuoteQualifiedIdentifier(testSchema, testTable), value)
 	}
 	return m
+}
+
+func newSeededPrimaryKeyMap(seed bool) *synclib.Map[string, []string] {
+	m := synclib.NewMap[string, []string]()
+	if seed {
+		m.Set(pglib.QuoteQualifiedIdentifier(testSchema, testTable), []string{`"id"`})
+	}
+	return m
+}
+
+func TestPGSchemaObserver_getPrimaryKeyColumns(t *testing.T) {
+	t.Parallel()
+
+	quotedTable := pglib.QuoteQualifiedIdentifier(testSchema, testTable)
+	queries := 0
+	o := &pgSchemaObserver{
+		logger:                 loglib.NewNoopLogger(),
+		primaryKeyTableColumns: synclib.NewMap[string, []string](),
+		pgConn: &pgmocks.Querier{
+			QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+				queries++
+				require.Equal(t, primaryKeyColumnsQuery, query)
+				require.Equal(t, []any{testSchema, testTable}, args)
+				names := []string{"tenant_id", "item_id"}
+				next := -1
+				return &pgmocks.Rows{
+					CloseFn: func() {},
+					NextFn:  func(i uint) bool { next++; return next < len(names) },
+					ScanFn: func(i uint, dest ...any) error {
+						colName, ok := dest[0].(*string)
+						require.True(t, ok)
+						*colName = names[next]
+						return nil
+					},
+					ErrFn: func() error { return nil },
+				}, nil
+			},
+		},
+	}
+
+	for range 2 {
+		columns, err := o.getPrimaryKeyColumns(context.TODO(), testSchema, testTable)
+		require.NoError(t, err)
+		require.Equal(t, []string{`"tenant_id"`, `"item_id"`}, columns)
+	}
+	require.Equal(t, 1, queries, "the second lookup is served from the cache")
+
+	// A DDL event replaces the cached key with the one it carries, and a
+	// table column object, which carries none, leaves it alone.
+	o.updatePrimaryKeyColumns((&wal.DDLEvent{Objects: []wal.DDLObject{
+		{Type: "table", Identity: testSchema + "." + testTable, Schema: testSchema, PrimaryKeyColumns: []string{"id"}},
+		{Type: "table column", Identity: testSchema + "." + testTable + ".name", Schema: testSchema},
+	}}).GetTableObjects())
+	cached, found := o.primaryKeyTableColumns.Get(quotedTable)
+	require.True(t, found)
+	require.Equal(t, []string{`"id"`}, cached)
 }
 
 func newSeededSequenceMap(seed bool) *synclib.Map[string, map[string]string] {

@@ -42,6 +42,11 @@ type schemaInfo struct {
 	// (see needsTextCopyForColumns), and the bulk delete path must bind their
 	// values as text[] and cast them back on the target (see bindAsText).
 	enumColumns map[string]enumColumn
+	// primaryKeyColumns are the quoted names of the target table's primary
+	// key columns, empty when it has none. They give an insert its ON CONFLICT
+	// target when the event carries no identity metadata, which is every
+	// insert of a pipeline that runs without the injector.
+	primaryKeyColumns []string
 	// compositeColumns is the set of quoted column names whose type resolves to
 	// a composite (row) type. pgx has no binary codec for a composite OID, and
 	// the type name alone cannot tell: a composite may share its name with a

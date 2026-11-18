@@ -201,6 +201,48 @@ func Test_BulkQueries_AcceptedByPostgres(t *testing.T) {
 				requireNameAt(t, conn, "SELECT name FROM bulk_insert_conflict WHERE id = 50", "row_50")
 			},
 		},
+		{
+			// Postgres refuses a targetless ON CONFLICT on a table with a
+			// deferrable unique constraint, so the insert has to name the
+			// primary key, read here from the catalog as the observer does.
+			name: "insert with on conflict do nothing beside a deferrable unique constraint",
+			setup: []string{
+				`CREATE TABLE insert_deferrable(id bigint PRIMARY KEY, slot bigint,
+					CONSTRAINT insert_deferrable_slot UNIQUE (slot) DEFERRABLE INITIALLY DEFERRED)`,
+				`INSERT INTO insert_deferrable(id, slot) VALUES (1, 100)`,
+			},
+			onConflictAction: "nothing",
+			build: func(t *testing.T, a *dmlAdapter) []*query {
+				observer := &pgSchemaObserver{pgConn: conn, logger: loglib.NewNoopLogger()}
+				primaryKey, err := observer.queryPrimaryKeyColumns(ctx, "public", "insert_deferrable")
+				require.NoError(t, err)
+				require.Equal(t, []string{`"id"`}, primaryKey)
+
+				events := make([]*wal.Data, 0, 2)
+				for i := 1; i <= 2; i++ {
+					events = append(events, &wal.Data{
+						Action: "I",
+						Schema: "public",
+						Table:  "insert_deferrable",
+						Columns: []wal.Column{
+							{Name: "id", Type: "bigint", Value: float64(i)},
+							{Name: "slot", Type: "bigint", Value: float64(i * 1000)},
+						},
+					})
+				}
+				si := schemaInfo{primaryKeyColumns: primaryKey}
+				queries := a.buildBulkInsertQueries(events, si)
+				require.Len(t, queries, 1)
+				return append(queries, a.buildInsertQueries(events[1], si)...)
+			},
+			wantSQL: `ON CONFLICT ("id") DO NOTHING`,
+			assert: func(t *testing.T, conn pglib.Querier) {
+				requireCount(t, conn, "SELECT count(*) FROM insert_deferrable", 2)
+				// the redelivered row is kept as it was, and the new one landed
+				requireCount(t, conn, "SELECT slot FROM insert_deferrable WHERE id = 1", 100)
+				requireCount(t, conn, "SELECT slot FROM insert_deferrable WHERE id = 2", 2000)
+			},
+		},
 	}
 
 	for _, tc := range tests {

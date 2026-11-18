@@ -178,6 +178,7 @@ func IsRetriableError(err error) bool {
 	featureNotSupported := &postgres.ErrFeatureNotSupported{}
 	valueEncoding := &postgres.ErrValueEncoding{}
 	dataException := &postgres.ErrDataException{}
+	preconditionFailed := &postgres.ErrPreconditionFailed{}
 	activeSQLTransaction := &postgres.ErrActiveSQLTransaction{}
 	switch {
 	case errors.As(mappedErr, &permissionDenied),
@@ -190,6 +191,7 @@ func IsRetriableError(err error) bool {
 		errors.As(mappedErr, &featureNotSupported),
 		errors.As(mappedErr, &valueEncoding),
 		errors.As(mappedErr, &dataException),
+		errors.As(mappedErr, &preconditionFailed),
 		errors.As(mappedErr, &activeSQLTransaction):
 		return false
 	}

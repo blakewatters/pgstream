@@ -590,6 +590,17 @@ func TestQuerier_isRetriableError(t *testing.T) {
 			wantIsRetriable: false,
 		},
 		{
+			// A statement postgres refuses for what the table is fails the
+			// same way every time. The writer drops such a query, which it
+			// can only do once the retrier hands the error back.
+			name: "on conflict against a deferrable unique constraint",
+			err: &pgconn.PgError{
+				Code:    "55000",
+				Message: "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters",
+			},
+			wantIsRetriable: false,
+		},
+		{
 			name:            "wrapped data exception",
 			err:             fmt.Errorf("copy from: %w", &postgres.ErrDataException{}),
 			wantIsRetriable: false,

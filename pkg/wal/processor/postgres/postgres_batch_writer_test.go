@@ -1230,3 +1230,168 @@ func TestBatchWriter_execQueries_isolation(t *testing.T) {
 		require.NotErrorIs(t, err, batchErr)
 	})
 }
+
+func TestBatchWriter_sendBatch_ddlOncePerTransaction(t *testing.T) {
+	t.Parallel()
+
+	// A multi-command statement reaches the writer once per command, each copy
+	// with the schema of its own command.
+	const body = "CREATE TABLE t (id int); CREATE TABLE IF NOT EXISTS other.u (id int)"
+	const otherBody = "CREATE INDEX t_idx ON t (id)"
+
+	ddlMsg := func(xid int64, schema, sql string) *walMessage {
+		return &walMessage{
+			data:  &wal.Data{Action: "M", Prefix: "pgstream.ddl", Schema: schema, XID: xid, Content: sql},
+			isDDL: true,
+		}
+	}
+
+	errAlreadyExists := &pglib.ErrRelationAlreadyExists{Details: `relation "t" already exists`}
+	errDoesNotExist := &pglib.ErrRelationDoesNotExist{Details: `relation "t" does not exist`}
+
+	tests := []struct {
+		name string
+		// batches are sent in order through the same writer
+		batches [][]*walMessage
+		// ddlErrs fails the nth DDL replay (0-based) with the given error
+		ddlErrs map[int]error
+
+		wantReplays []string
+	}{
+		{
+			name: "copies of a statement in one transaction replay once",
+			batches: [][]*walMessage{{
+				ddlMsg(10, "public", body),
+				ddlMsg(10, "other", body),
+				ddlMsg(10, "public", otherBody),
+			}},
+			wantReplays: []string{"public: " + body, "public: " + otherBody},
+		},
+		{
+			name: "the same statement in another transaction replays again",
+			batches: [][]*walMessage{{
+				ddlMsg(10, "public", body),
+				ddlMsg(11, "public", body),
+			}},
+			wantReplays: []string{"public: " + body, "public: " + body},
+		},
+		{
+			name: "a transaction that spans batches replays a statement once",
+			batches: [][]*walMessage{
+				{ddlMsg(10, "public", body)},
+				{ddlMsg(10, "other", body)},
+			},
+			wantReplays: []string{"public: " + body},
+		},
+		{
+			name: "a copy whose objects already exist ends the statement's replays",
+			batches: [][]*walMessage{{
+				ddlMsg(10, "public", body),
+				ddlMsg(10, "other", body),
+			}},
+			ddlErrs:     map[int]error{0: errAlreadyExists},
+			wantReplays: []string{"public: " + body},
+		},
+		{
+			name: "a copy that fails otherwise leaves the next copy its chance",
+			batches: [][]*walMessage{{
+				ddlMsg(10, "other", body),
+				ddlMsg(10, "public", body),
+				ddlMsg(10, "third", body),
+			}},
+			ddlErrs:     map[int]error{0: errDoesNotExist},
+			wantReplays: []string{"other: " + body, "public: " + body},
+		},
+		{
+			name: "without transaction ids every copy replays",
+			batches: [][]*walMessage{{
+				ddlMsg(0, "public", body),
+				ddlMsg(0, "other", body),
+			}},
+			wantReplays: []string{"public: " + body, "other: " + body},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var replays []string
+			pgconn := &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					var schema string
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+							if sql == prependSearchPath {
+								quoted, ok := args[0].(string)
+								require.True(t, ok)
+								schema = strings.Trim(quoted, `"`)
+								return pglib.CommandTag{}, nil
+							}
+							n := len(replays)
+							replays = append(replays, schema+": "+sql)
+							if err, ok := tc.ddlErrs[n]; ok {
+								return pglib.CommandTag{}, err
+							}
+							return pglib.CommandTag{}, nil
+						},
+					}
+					return f(&mockTx)
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			}
+
+			writer := &BatchWriter{
+				Writer: &Writer{
+					logger: loglib.NewNoopLogger(),
+					pgConn: pgconn,
+					adapter: &mockAdapter{
+						walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+							return []*query{{schema: e.Data.Schema, sql: e.Data.Content, isDDL: true}}, nil
+						},
+					},
+				},
+				dmlAdapter:  mustNewDMLAdapter(t),
+				batchSender: batchmocks.NewBatchSender[*walMessage](),
+			}
+			defer writer.Close()
+
+			for _, msgs := range tc.batches {
+				err := writer.sendBatch(context.Background(), batch.NewBatch(msgs, []wal.CommitPosition{testCommitPosition}))
+				require.NoError(t, err)
+			}
+
+			// every replay the writer ran, failed ones included, in order
+			require.Equal(t, tc.wantReplays, replays)
+		})
+	}
+}
+
+// A query the writer would drop must reach it: the retrier wraps every
+// transaction the writer runs, and its default policy has no bound, so an
+// error it retries is one the writer never gets to drop. That held
+// replication for days on a statement postgres would never accept.
+func TestBatchWriter_droppableErrorsAreNotRetried(t *testing.T) {
+	t.Parallel()
+
+	w := &BatchWriter{}
+	droppable := []error{
+		&pglib.ErrRelationDoesNotExist{},
+		&pglib.ErrConstraintViolation{},
+		&pglib.ErrSyntaxError{},
+		&pglib.ErrDataException{},
+		&pglib.ErrRelationAlreadyExists{},
+		&pglib.ErrPreconditionFailed{},
+		&pglib.ErrFeatureNotSupported{},
+		&pglib.ErrValueEncoding{},
+	}
+	for _, err := range droppable {
+		t.Run(fmt.Sprintf("%T", err), func(t *testing.T) {
+			t.Parallel()
+
+			require.False(t, w.isInternalError(err), "the writer no longer drops this error; remove it from this list")
+			require.False(t, retrier.IsRetriableError(err))
+			require.False(t, retrier.IsRetriableError(fmt.Errorf("batch query 0: %w", err)))
+		})
+	}
+}

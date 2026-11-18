@@ -728,6 +728,66 @@ func TestBuildBulkInsertQueries_OnConflictUpdate(t *testing.T) {
 	require.Contains(t, queries[0].sql, "DO UPDATE SET")
 }
 
+// The conflict target comes from the event's identity metadata when it has
+// any, and otherwise from the target table's primary key. A table with no key
+// known keeps the targetless form.
+func TestBuildInsertQueries_OnConflictDoNothingTarget(t *testing.T) {
+	t.Parallel()
+
+	a, err := newDMLAdapter("nothing", false, loglib.NewNoopLogger())
+	require.NoError(t, err)
+
+	event := func(metadata wal.Metadata) *wal.Data {
+		return &wal.Data{
+			Action: "I",
+			Schema: "public",
+			Table:  "users",
+			Columns: []wal.Column{
+				{ID: "col1", Name: "id", Type: "bigint", Value: float64(1)},
+				{ID: "col2", Name: "name", Type: "text", Value: "alice"},
+			},
+			Metadata: metadata,
+		}
+	}
+
+	tests := []struct {
+		name     string
+		metadata wal.Metadata
+		si       schemaInfo
+		want     string
+	}{
+		{
+			name: "target table primary key",
+			si:   schemaInfo{primaryKeyColumns: []string{`"tenant_id"`, `"id"`}},
+			want: ` ON CONFLICT ("tenant_id","id") DO NOTHING`,
+		},
+		{
+			name:     "event identity metadata wins",
+			metadata: wal.Metadata{InternalColIDs: []string{"col1"}},
+			si:       schemaInfo{primaryKeyColumns: []string{`"name"`}},
+			want:     ` ON CONFLICT ("id") DO NOTHING`,
+		},
+		{
+			name: "no primary key known",
+			want: ` ON CONFLICT DO NOTHING`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			single := a.buildInsertQueries(event(tc.metadata), tc.si)
+			require.NotEmpty(t, single)
+			require.True(t, strings.HasSuffix(single[0].sql, "VALUES($1, $2)"+tc.want), single[0].sql)
+
+			bulk := a.buildBulkInsertQueries([]*wal.Data{event(tc.metadata), event(tc.metadata)}, tc.si)
+			require.NotEmpty(t, bulk)
+			require.True(t, strings.HasSuffix(bulk[0].sql, "($1, $2),($3, $4)"+tc.want), bulk[0].sql)
+		})
+	}
+}
+
 func TestBuildBulkInsertQueries_Empty(t *testing.T) {
 	t.Parallel()
 
